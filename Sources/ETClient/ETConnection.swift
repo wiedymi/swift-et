@@ -14,6 +14,8 @@ public enum ETClientError: Error, Equatable, Sendable {
     case connectionInProgress
     case connectionClosed
     case invalidTerminalSize(rows: Int, columns: Int)
+    case invalidTunnelSpecification(String, ETTunnelParseReason)
+    case forwardingFailure(String)
 }
 
 public enum ETConnectionState: Equatable, Sendable {
@@ -148,6 +150,11 @@ actor ETConnection {
         try await withCheckedThrowingContinuation { continuation in
             pendingWrites.append(PendingWrite(packet: packet, continuation: continuation))
             startWriteDrainIfNeeded()
+        }
+        if state == .connected,
+           packet.header != UInt8(Et_TerminalPacketType.keepAlive.rawValue),
+           packet.header != UInt8(Et_EtPacketType.heartbeat.rawValue) {
+            startHeartbeat(generation: generation)
         }
     }
 

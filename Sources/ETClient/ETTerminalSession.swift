@@ -7,6 +7,8 @@ public actor ETTerminalSession {
 
     private let outputContinuation: AsyncStream<Data>.Continuation
     private let connection: ETConnection
+    private let portForwardHandler: PortForwardHandler
+    private let forwardTunnels: [ETTunnel]
     private var initialPayload: Et_InitialPayload
     private var packetTask: Task<Void, Never>?
     private var isConnecting = false
@@ -18,15 +20,51 @@ public actor ETTerminalSession {
         port: UInt16 = 2022,
         clientID: String,
         passkey: Data,
+        tunnels: [ETTunnel] = [],
+        reverseTunnels: [ETTunnel] = [],
+        jumphost: Bool = false,
         environmentVariables: [String: String] = [:]
     ) throws {
         try self.init(
             endpoint: TransportEndpoint(host: host, port: port),
             clientID: clientID,
             passkey: passkey,
+            tunnels: tunnels,
+            reverseTunnels: reverseTunnels,
+            jumphost: jumphost,
             environmentVariables: environmentVariables,
             transportFactory: NWTransportFactory(),
-            configuration: ETConnectionConfiguration()
+            configuration: ETConnectionConfiguration(),
+            listenerFactory: SystemForwardingListenerFactory(),
+            forwardingSocketFactory: SystemForwardingSocketFactory()
+        )
+    }
+
+    public init(
+        host: String,
+        port: UInt16 = 2022,
+        clientID: String,
+        passkey: Data,
+        tunnelSpecification: String,
+        reverseTunnelSpecification: String = "",
+        jumphost: Bool = false,
+        environmentVariables: [String: String] = [:]
+    ) throws {
+        let tunnels = tunnelSpecification.isEmpty
+            ? []
+            : try ETTunnel.parse(tunnelSpecification)
+        let reverseTunnels = reverseTunnelSpecification.isEmpty
+            ? []
+            : try ETTunnel.parse(reverseTunnelSpecification)
+        try self.init(
+            host: host,
+            port: port,
+            clientID: clientID,
+            passkey: passkey,
+            tunnels: tunnels,
+            reverseTunnels: reverseTunnels,
+            jumphost: jumphost,
+            environmentVariables: environmentVariables
         )
     }
 
@@ -34,18 +72,25 @@ public actor ETTerminalSession {
         endpoint: TransportEndpoint,
         clientID: String,
         passkey: Data,
+        tunnels: [ETTunnel] = [],
+        reverseTunnels: [ETTunnel] = [],
+        jumphost: Bool = false,
         environmentVariables: [String: String] = [:],
         transportFactory: any TransportFactory,
-        configuration: ETConnectionConfiguration
+        configuration: ETConnectionConfiguration,
+        listenerFactory: any ForwardingListenerFactory = SystemForwardingListenerFactory(),
+        forwardingSocketFactory: any ForwardingSocketFactory = SystemForwardingSocketFactory()
     ) throws {
         let outputPair = AsyncStream<Data>.makeStream(bufferingPolicy: .unbounded)
         output = outputPair.stream
         outputContinuation = outputPair.continuation
 
         var payload = Et_InitialPayload()
-        payload.jumphost = false
+        payload.jumphost = jumphost
+        payload.reversetunnels = reverseTunnels.map { $0.protobufRequest() }
         payload.environmentvariables = environmentVariables
         initialPayload = payload
+        forwardTunnels = tunnels
 
         let newConnection = try ETConnection(
             endpoint: endpoint,
@@ -55,6 +100,11 @@ public actor ETTerminalSession {
             configuration: configuration
         )
         connection = newConnection
+        portForwardHandler = PortForwardHandler(
+            connection: newConnection,
+            listenerFactory: listenerFactory,
+            socketFactory: forwardingSocketFactory
+        )
         stateChanges = newConnection.stateChanges
     }
 
@@ -65,6 +115,7 @@ public actor ETTerminalSession {
         isConnecting = true
         startPacketForwarding()
         do {
+            try await portForwardHandler.start(forwardTunnels: forwardTunnels)
             try await connection.connect(initialPayload: initialPayload)
             isConnecting = false
             hasConnected = true
@@ -73,6 +124,7 @@ public actor ETTerminalSession {
             hasConnected = false
             packetTask?.cancel()
             packetTask = nil
+            await portForwardHandler.close()
             throw error
         }
     }
@@ -113,6 +165,7 @@ public actor ETTerminalSession {
         isClosed = true
         packetTask?.cancel()
         packetTask = nil
+        await portForwardHandler.close()
         await connection.close()
         outputContinuation.finish()
     }
@@ -123,13 +176,25 @@ public actor ETTerminalSession {
         packetTask = Task { [weak self] in
             for await packet in packets {
                 guard !Task.isCancelled else { return }
-                guard packet.header == UInt8(Et_TerminalPacketType.terminalBuffer.rawValue),
-                      let terminalBuffer = try? Et_TerminalBuffer(
-                        serializedBytes: packet.payload
-                      ) else {
-                    continue
+                if packet.header == UInt8(Et_TerminalPacketType.terminalBuffer.rawValue),
+                   let terminalBuffer = try? Et_TerminalBuffer(
+                    serializedBytes: packet.payload
+                   ) {
+                    await self?.yieldOutput(terminalBuffer.buffer)
+                } else if packet.header == UInt8(
+                    Et_TerminalPacketType.portForwardData.rawValue
+                ) || packet.header == UInt8(
+                    Et_TerminalPacketType.portForwardDestinationRequest.rawValue
+                ) || packet.header == UInt8(
+                    Et_TerminalPacketType.portForwardDestinationResponse.rawValue
+                ) {
+                    do {
+                        try await self?.portForwardHandler.handle(packet)
+                    } catch {
+                        await self?.close()
+                        return
+                    }
                 }
-                await self?.yieldOutput(terminalBuffer.buffer)
             }
             guard !Task.isCancelled else { return }
             await self?.finishOutput()

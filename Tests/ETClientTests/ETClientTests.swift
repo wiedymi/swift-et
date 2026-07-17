@@ -149,22 +149,280 @@ final class ETClientTests: XCTestCase {
         await session.close()
     }
 
+    func testTunnelGrammarMatchesCppValidCases() throws {
+        XCTAssertEqual(
+            try ETTunnel.parse("1000:2000"),
+            [
+                ETTunnel(
+                    source: .endpoint(.tcp(host: "localhost", port: 1000)),
+                    destination: .tcp(host: nil, port: 2000)
+                )
+            ]
+        )
+        XCTAssertEqual(try ETTunnel.parse("8000-8002:9000-9002").count, 3)
+        XCTAssertEqual(
+            try ETTunnel.parse("SSH_AUTH_SOCK:/tmp/agent.sock"),
+            [
+                ETTunnel(
+                    source: .environmentVariable("SSH_AUTH_SOCK"),
+                    destination: .unix(path: "/tmp/agent.sock")
+                )
+            ]
+        )
+        XCTAssertEqual(
+            try ETTunnel.parse("/tmp/local.sock:/tmp/remote.sock").first,
+            ETTunnel(
+                source: .endpoint(.unix(path: "/tmp/local.sock")),
+                destination: .unix(path: "/tmp/remote.sock")
+            )
+        )
+        XCTAssertEqual(
+            try ETTunnel.parse("[::1]:8888:[2001:db8::1]:9999").first,
+            ETTunnel(
+                source: .endpoint(.tcp(host: "::1", port: 8888)),
+                destination: .tcp(host: "2001:db8::1", port: 9999)
+            )
+        )
+    }
+
+    func testTunnelGrammarRejectsMalformedCasesWithTypedReasons() {
+        let cases: [(String, ETTunnelParseReason)] = [
+            ("", .emptySpecification),
+            ("8080", .missingSourceOrDestination),
+            ("abc:123", .invalidPort("abc")),
+            ("8000-8001:9000", .rangePairRequired),
+            ("8000-8002:9000-9001", .rangeLengthMismatch),
+            ("9000-8000:9000-8000", .invalidRange("9000-8000")),
+            ("8888:0.0.0.0:9999", .sshStyleRequiresFourParts),
+            ("::1:8888:0.0.0.0:9999", .unbracketedIPv6),
+        ]
+        for (specification, reason) in cases {
+            XCTAssertThrowsError(try ETTunnel.parse(specification)) { error in
+                XCTAssertEqual(
+                    error as? ETClientError,
+                    .invalidTunnelSpecification(specification, reason)
+                )
+            }
+        }
+    }
+
+    func testForwardTunnelEchoAndRemoteClose() async throws {
+        let server = FakeETServer()
+        let forwardingNetwork = InMemoryForwardingNetwork()
+        let tunnel = try XCTUnwrap(ETTunnel.parse("7000:8000").first)
+        let session = try makeSession(
+            server: server,
+            tunnels: [tunnel],
+            forwardingNetwork: forwardingNetwork,
+            keepAliveInterval: .seconds(10)
+        )
+        try await session.connect()
+
+        let localSocket = try await forwardingNetwork.connectClient(
+            to: .tcp(host: "localhost", port: 7000)
+        )
+        let payload = Data("forward-data".utf8)
+        try await localSocket.write(payload)
+        let echoedPayload = try await localSocket.read()
+        XCTAssertEqual(echoedPayload, payload)
+
+        try await eventually {
+            await server.snapshot().forwardData == [payload]
+        }
+        try await server.closeForwardSocket()
+        do {
+            _ = try await localSocket.read()
+            XCTFail("Expected remote close to tear down the local socket")
+        } catch {
+            XCTAssertEqual(error as? TransportError, .connectionClosed)
+        }
+        await session.close()
+    }
+
+    func testReverseTunnelEndToEndAndJumphostPayload() async throws {
+        let server = FakeETServer()
+        let forwardingNetwork = InMemoryForwardingNetwork()
+        let reverseTunnel = try XCTUnwrap(ETTunnel.parse("9000:9100").first)
+        let session = try makeSession(
+            server: server,
+            reverseTunnels: [reverseTunnel],
+            jumphost: true,
+            forwardingNetwork: forwardingNetwork,
+            keepAliveInterval: .seconds(10)
+        )
+        try await session.connect()
+
+        let snapshot = await server.snapshot()
+        let initialPayload = try XCTUnwrap(snapshot.initialPayloads.first)
+        XCTAssertTrue(initialPayload.jumphost)
+        XCTAssertEqual(initialPayload.reversetunnels.count, 1)
+
+        try await server.requestReverseDestination(
+            reverseTunnel.destination.protobufEndpoint()
+        )
+        try await eventually {
+            await server.snapshot().reverseSocketID != nil
+        }
+        let destinationSocket = try await eventuallyValue {
+            await forwardingNetwork.takeDialedPeer(
+                for: .tcp(host: nil, port: 9100)
+            )
+        }
+
+        let inbound = Data("reverse-in".utf8)
+        try await server.sendReverseData(inbound)
+        let receivedInbound = try await destinationSocket.read()
+        XCTAssertEqual(receivedInbound, inbound)
+
+        let outbound = Data("reverse-out".utf8)
+        try await destinationSocket.write(outbound)
+        try await eventually {
+            await server.snapshot().reverseData == [outbound]
+        }
+        await session.close()
+    }
+
+    func testReverseEnvironmentUnixSocketEndToEnd() async throws {
+        let server = FakeETServer()
+        let forwardingNetwork = InMemoryForwardingNetwork()
+        let reverseTunnel = try XCTUnwrap(
+            ETTunnel.parse("SSH_AUTH_SOCK:/tmp/local-agent.sock").first
+        )
+        let session = try makeSession(
+            server: server,
+            reverseTunnels: [reverseTunnel],
+            forwardingNetwork: forwardingNetwork,
+            keepAliveInterval: .seconds(10)
+        )
+        try await session.connect()
+
+        let snapshot = await server.snapshot()
+        let request = try XCTUnwrap(snapshot.initialPayloads.first?.reversetunnels.first)
+        XCTAssertFalse(request.hasSource)
+        XCTAssertEqual(request.environmentvariable, "SSH_AUTH_SOCK")
+        XCTAssertEqual(request.destination.name, "/tmp/local-agent.sock")
+
+        try await server.requestReverseDestination(request.destination)
+        try await eventually {
+            await server.snapshot().reverseSocketID != nil
+        }
+        let localSocket = try await eventuallyValue {
+            await forwardingNetwork.takeDialedPeer(
+                for: .unix(path: "/tmp/local-agent.sock")
+            )
+        }
+        let inbound = Data("agent-request".utf8)
+        try await server.sendReverseData(inbound)
+        let receivedInbound = try await localSocket.read()
+        XCTAssertEqual(receivedInbound, inbound)
+
+        let outbound = Data("agent-response".utf8)
+        try await localSocket.write(outbound)
+        try await eventually {
+            await server.snapshot().reverseData == [outbound]
+        }
+        await session.close()
+    }
+
+    func testForwardingTrafficRefreshesKeepAliveDeadline() async throws {
+        let server = FakeETServer(echoKeepAlives: true)
+        let forwardingNetwork = InMemoryForwardingNetwork()
+        let tunnel = try XCTUnwrap(ETTunnel.parse("7100:8100").first)
+        let session = try makeSession(
+            server: server,
+            tunnels: [tunnel],
+            forwardingNetwork: forwardingNetwork,
+            keepAliveInterval: .milliseconds(200)
+        )
+        try await session.connect()
+        let localSocket = try await forwardingNetwork.connectClient(
+            to: .tcp(host: "localhost", port: 7100)
+        )
+
+        for index in 0..<7 {
+            let payload = Data("keepalive-\(index)".utf8)
+            try await localSocket.write(payload)
+            let echoedPayload = try await localSocket.read()
+            XCTAssertEqual(echoedPayload, payload)
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let keepAliveCountDuringTraffic = await server.snapshot().keepAliveCount
+        XCTAssertEqual(keepAliveCountDuringTraffic, 0)
+        try await eventually(timeout: .seconds(1)) {
+            await server.snapshot().keepAliveCount >= 1
+        }
+        await session.close()
+    }
+
+    func testForwardDataSurvivesReconnectWhileSocketRemainsActive() async throws {
+        let server = FakeETServer()
+        let forwardingNetwork = InMemoryForwardingNetwork()
+        let tunnel = try XCTUnwrap(ETTunnel.parse("7200:8200").first)
+        let session = try makeSession(
+            server: server,
+            tunnels: [tunnel],
+            forwardingNetwork: forwardingNetwork,
+            reconnectDelay: .milliseconds(5),
+            keepAliveInterval: .seconds(10)
+        )
+        try await session.connect()
+        let localSocket = try await forwardingNetwork.connectClient(
+            to: .tcp(host: "localhost", port: 7200)
+        )
+
+        let before = Data("before".utf8)
+        try await localSocket.write(before)
+        let echoedBefore = try await localSocket.read()
+        XCTAssertEqual(echoedBefore, before)
+
+        await server.dropNextClientPacket(afterByteCount: 5)
+        let recovered = Data("through-reconnect".utf8)
+        try await localSocket.write(recovered)
+        let echoedRecovered = try await localSocket.read()
+        XCTAssertEqual(echoedRecovered, recovered)
+
+        try await eventually {
+            let snapshot = await server.snapshot()
+            return snapshot.connectionCount >= 2
+                && snapshot.forwardData == [before, recovered]
+        }
+        await session.close()
+    }
+
     private func makeSession(
         server: FakeETServer,
+        tunnels: [ETTunnel] = [],
+        reverseTunnels: [ETTunnel] = [],
+        jumphost: Bool = false,
+        forwardingNetwork: InMemoryForwardingNetwork? = nil,
         reconnectDelay: Duration = .milliseconds(10),
         keepAliveInterval: Duration = .seconds(1)
     ) throws -> ETTerminalSession {
-        try ETTerminalSession(
+        let listenerFactory: any ForwardingListenerFactory
+        let socketFactory: any ForwardingSocketFactory
+        if let forwardingNetwork {
+            listenerFactory = forwardingNetwork
+            socketFactory = forwardingNetwork
+        } else {
+            listenerFactory = SystemForwardingListenerFactory()
+            socketFactory = SystemForwardingSocketFactory()
+        }
+        return try ETTerminalSession(
             endpoint: TransportEndpoint(host: "in-memory", port: 2022),
             clientID: "test-client",
             passkey: key,
+            tunnels: tunnels,
+            reverseTunnels: reverseTunnels,
+            jumphost: jumphost,
             environmentVariables: ["TERM": "xterm-256color"],
             transportFactory: InMemoryTransportFactory(server: server),
             configuration: ETConnectionConfiguration(
                 reconnectDelay: reconnectDelay,
                 initializationTimeout: .seconds(1),
                 keepAliveInterval: keepAliveInterval
-            )
+            ),
+            listenerFactory: listenerFactory,
+            forwardingSocketFactory: socketFactory
         )
     }
 
@@ -180,6 +438,19 @@ final class ETClientTests: XCTestCase {
         }
         XCTFail("Condition was not satisfied before timeout")
     }
+
+    private func eventuallyValue<Value: Sendable>(
+        timeout: Duration = .seconds(2),
+        value: @escaping @Sendable () async -> Value?
+    ) async throws -> Value {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let value = await value() { return value }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        throw ETClientError.forwardingFailure("Timed out waiting for test value")
+    }
 }
 
 private struct TerminalSize: Equatable, Sendable {
@@ -194,6 +465,10 @@ private struct ServerSnapshot: Sendable {
     let terminalInput: [Data]
     let terminalSizes: [TerminalSize]
     let keepAliveCount: Int
+    let forwardData: [Data]
+    let reverseData: [Data]
+    let forwardSocketID: Int32?
+    let reverseSocketID: Int32?
 }
 
 private actor OutputCollector {
@@ -246,6 +521,11 @@ private actor FakeETServer {
     private var terminalSizes: [TerminalSize] = []
     private var keepAliveCount = 0
     private var clientDropOffset: Int?
+    private var nextForwardSocketID: Int32 = 100
+    private var forwardSocketIDs: Set<Int32> = []
+    private var reverseSocketID: Int32?
+    private var forwardData: [Data] = []
+    private var reverseData: [Data] = []
 
     init(
         acceptance: ServerAcceptance = .normal,
@@ -315,6 +595,45 @@ private actor FakeETServer {
         }
     }
 
+    func requestReverseDestination(_ endpoint: Et_SocketEndpoint) async throws {
+        var request = Et_PortForwardDestinationRequest()
+        request.destination = endpoint
+        request.fd = 77
+        try await sendPacket(
+            header: .portForwardDestinationRequest,
+            payload: request.serializedData()
+        )
+    }
+
+    func sendReverseData(_ bytes: Data) async throws {
+        guard let reverseSocketID else {
+            throw ETClientError.forwardingFailure("Missing reverse socket id")
+        }
+        var data = Et_PortForwardData()
+        data.socketid = reverseSocketID
+        data.sourcetodestination = true
+        data.buffer = bytes
+        try await sendPacket(
+            header: .portForwardData,
+            payload: data.serializedData()
+        )
+    }
+
+    func closeForwardSocket() async throws {
+        guard let socketID = forwardSocketIDs.first else {
+            throw ETClientError.forwardingFailure("Missing forward socket id")
+        }
+        var data = Et_PortForwardData()
+        data.socketid = socketID
+        data.sourcetodestination = false
+        data.closed = true
+        try await sendPacket(
+            header: .portForwardData,
+            payload: data.serializedData()
+        )
+        forwardSocketIDs.remove(socketID)
+    }
+
     func snapshot() -> ServerSnapshot {
         ServerSnapshot(
             connectionCount: connectionCount,
@@ -322,7 +641,11 @@ private actor FakeETServer {
             initialPayloads: initialPayloads,
             terminalInput: terminalInput,
             terminalSizes: terminalSizes,
-            keepAliveCount: keepAliveCount
+            keepAliveCount: keepAliveCount,
+            forwardData: forwardData,
+            reverseData: reverseData,
+            forwardSocketID: forwardSocketIDs.first,
+            reverseSocketID: reverseSocketID
         )
     }
 
@@ -432,6 +755,53 @@ private actor FakeETServer {
                 await deliverChunked(framed)
             }
 
+        case UInt8(Et_TerminalPacketType.portForwardDestinationRequest.rawValue):
+            let request = try Et_PortForwardDestinationRequest(
+                serializedBytes: packet.payload
+            )
+            let socketID = nextForwardSocketID
+            nextForwardSocketID = nextForwardSocketID == Int32.max
+                ? 100
+                : nextForwardSocketID + 1
+            forwardSocketIDs.insert(socketID)
+            var response = Et_PortForwardDestinationResponse()
+            response.clientfd = request.fd
+            response.socketid = socketID
+            try await sendPacket(
+                header: .portForwardDestinationResponse,
+                payload: response.serializedData()
+            )
+
+        case UInt8(Et_TerminalPacketType.portForwardDestinationResponse.rawValue):
+            let response = try Et_PortForwardDestinationResponse(
+                serializedBytes: packet.payload
+            )
+            guard !response.hasError else {
+                throw ETClientError.forwardingFailure(response.error)
+            }
+            reverseSocketID = response.socketid
+
+        case UInt8(Et_TerminalPacketType.portForwardData.rawValue):
+            let data = try Et_PortForwardData(serializedBytes: packet.payload)
+            if forwardSocketIDs.contains(data.socketid), data.sourcetodestination {
+                if data.hasBuffer {
+                    forwardData.append(data.buffer)
+                }
+                var echo = data
+                echo.sourcetodestination = false
+                try await sendPacket(
+                    header: .portForwardData,
+                    payload: echo.serializedData()
+                )
+                if data.hasClosed || data.hasError {
+                    forwardSocketIDs.remove(data.socketid)
+                }
+            } else if data.socketid == reverseSocketID, !data.sourcetodestination {
+                if data.hasBuffer {
+                    reverseData.append(data.buffer)
+                }
+            }
+
         default:
             throw ETClientError.malformedFrame("Unexpected client packet \(packet.header)")
         }
@@ -444,6 +814,17 @@ private actor FakeETServer {
             throw TransportError.connectionClosed
         }
         return framed
+    }
+
+    private func sendPacket(
+        header: Et_TerminalPacketType,
+        payload: Data
+    ) async throws {
+        let framed = try await makeServerPacket(
+            header: UInt8(header.rawValue),
+            payload: payload
+        )
+        await deliverChunked(framed)
     }
 
     private func disconnectCurrentConnection() async {
@@ -606,5 +987,176 @@ private actor AsyncDataQueue {
         let currentWaiter = waiter
         waiter = nil
         currentWaiter?.resume(throwing: TransportError.connectionClosed)
+    }
+}
+
+private enum ForwardingEndpointKey: Hashable, Sendable {
+    case tcp(UInt16)
+    case unix(String)
+
+    init(_ endpoint: ETTunnelEndpoint) {
+        switch endpoint {
+        case .tcp(_, let port):
+            self = .tcp(port)
+        case .unix(let path):
+            self = .unix(path)
+        }
+    }
+}
+
+private actor InMemoryForwardingNetwork: ForwardingListenerFactory, ForwardingSocketFactory {
+    private var listeners: [ForwardingEndpointKey: InMemoryForwardingListener] = [:]
+    private var dialedPeers: [ForwardingEndpointKey: [InMemoryForwardingSocket]] = [:]
+
+    func makeListener(
+        for endpoint: ETTunnelEndpoint
+    ) async throws -> any ForwardingListener {
+        let key = ForwardingEndpointKey(endpoint)
+        guard listeners[key] == nil else {
+            throw ETClientError.forwardingFailure("Duplicate test listener")
+        }
+        let listener = InMemoryForwardingListener()
+        listeners[key] = listener
+        return listener
+    }
+
+    func connect(
+        to endpoint: ETTunnelEndpoint
+    ) async throws -> any ForwardingSocket {
+        let pair = InMemoryForwardingSocket.makePair()
+        dialedPeers[ForwardingEndpointKey(endpoint), default: []].append(pair.peer)
+        return pair.local
+    }
+
+    func connectClient(to endpoint: ETTunnelEndpoint) async throws -> InMemoryForwardingSocket {
+        guard let listener = listeners[ForwardingEndpointKey(endpoint)] else {
+            throw ETClientError.forwardingFailure("Missing test listener")
+        }
+        let pair = InMemoryForwardingSocket.makePair()
+        try await listener.enqueue(pair.peer)
+        return pair.local
+    }
+
+    func takeDialedPeer(for endpoint: ETTunnelEndpoint) -> InMemoryForwardingSocket? {
+        let key = ForwardingEndpointKey(endpoint)
+        guard var peers = dialedPeers[key], !peers.isEmpty else { return nil }
+        let peer = peers.removeFirst()
+        dialedPeers[key] = peers
+        return peer
+    }
+}
+
+private actor InMemoryForwardingListener: ForwardingListener {
+    private let queue = AsyncForwardingSocketQueue()
+    private var isStarted = false
+    private var isClosed = false
+
+    func start() throws {
+        guard !isClosed else { throw TransportError.connectionClosed }
+        isStarted = true
+    }
+
+    func accept() async throws -> any ForwardingSocket {
+        guard isStarted, !isClosed else { throw TransportError.connectionClosed }
+        return try await queue.next()
+    }
+
+    func enqueue(_ socket: any ForwardingSocket) async throws {
+        guard isStarted, !isClosed else { throw TransportError.connectionClosed }
+        await queue.push(socket)
+    }
+
+    func close() async {
+        guard !isClosed else { return }
+        isClosed = true
+        await queue.fail()
+    }
+}
+
+private actor InMemoryForwardingSocket: ForwardingSocket {
+    private let incoming: AsyncDataQueue
+    private let peerIncoming: AsyncDataQueue
+    private var isClosed = false
+
+    init(incoming: AsyncDataQueue, peerIncoming: AsyncDataQueue) {
+        self.incoming = incoming
+        self.peerIncoming = peerIncoming
+    }
+
+    static func makePair() -> (
+        local: InMemoryForwardingSocket,
+        peer: InMemoryForwardingSocket
+    ) {
+        let firstIncoming = AsyncDataQueue()
+        let secondIncoming = AsyncDataQueue()
+        return (
+            InMemoryForwardingSocket(
+                incoming: firstIncoming,
+                peerIncoming: secondIncoming
+            ),
+            InMemoryForwardingSocket(
+                incoming: secondIncoming,
+                peerIncoming: firstIncoming
+            )
+        )
+    }
+
+    func read() async throws -> Data {
+        guard !isClosed else { throw TransportError.connectionClosed }
+        return try await incoming.next()
+    }
+
+    func write(_ data: Data) async throws {
+        guard !isClosed else { throw TransportError.connectionClosed }
+        await peerIncoming.push(data)
+    }
+
+    func close() async {
+        guard !isClosed else { return }
+        isClosed = true
+        await incoming.fail()
+        await peerIncoming.fail()
+    }
+}
+
+private actor AsyncForwardingSocketQueue {
+    private var buffered: [any ForwardingSocket] = []
+    private var waiter: CheckedContinuation<any ForwardingSocket, any Error>?
+    private var isClosed = false
+
+    func next() async throws -> any ForwardingSocket {
+        if !buffered.isEmpty {
+            return buffered.removeFirst()
+        }
+        guard !isClosed else { throw TransportError.connectionClosed }
+        return try await withCheckedThrowingContinuation { continuation in
+            waiter = continuation
+        }
+    }
+
+    func push(_ socket: any ForwardingSocket) async {
+        guard !isClosed else {
+            await socket.close()
+            return
+        }
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: socket)
+        } else {
+            buffered.append(socket)
+        }
+    }
+
+    func fail() async {
+        guard !isClosed else { return }
+        isClosed = true
+        let currentWaiter = waiter
+        waiter = nil
+        currentWaiter?.resume(throwing: TransportError.connectionClosed)
+        let sockets = buffered
+        buffered.removeAll()
+        for socket in sockets {
+            await socket.close()
+        }
     }
 }
