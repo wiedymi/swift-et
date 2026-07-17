@@ -122,7 +122,7 @@ public actor BackedReader {
         guard encryptedPacket.encrypted else {
             throw ETProtocolError.packetNotEncrypted
         }
-        let plaintext = try crypto.open(Array(encryptedPacket.payload))
+        let plaintext = try crypto.open(encryptedPacket.payload)
         return Packet(
             encrypted: false,
             header: encryptedPacket.header,

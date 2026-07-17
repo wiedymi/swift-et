@@ -17,11 +17,11 @@ public actor SecretBox {
     }
 
     public func seal<Message: ContiguousBytes & Sendable>(_ message: Message) throws -> Data {
-        try state.seal(message.withUnsafeBytes { Array($0) })
+        try state.seal(message)
     }
 
     public func open<Ciphertext: ContiguousBytes & Sendable>(_ ciphertext: Ciphertext) throws -> Data {
-        try state.open(ciphertext.withUnsafeBytes { Array($0) })
+        try state.open(ciphertext)
     }
 }
 
@@ -41,12 +41,12 @@ struct SecretBoxState: Sendable {
         nonce[XSalsa20Poly1305.nonceByteCount - 1] = nonceMostSignificantByte
     }
 
-    mutating func seal(_ message: [UInt8]) throws -> Data {
+    mutating func seal<Message: ContiguousBytes>(_ message: Message) throws -> Data {
         incrementNonce()
         return try XSalsa20Poly1305.seal(message, nonce: nonce, key: key)
     }
 
-    mutating func open(_ ciphertext: [UInt8]) throws -> Data {
+    mutating func open<Ciphertext: ContiguousBytes>(_ ciphertext: Ciphertext) throws -> Data {
         incrementNonce()
         return try XSalsa20Poly1305.open(ciphertext, nonce: nonce, key: key)
     }

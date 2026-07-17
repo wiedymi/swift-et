@@ -51,7 +51,7 @@ public actor BackedWriter {
             }
         }
 
-        let encryptedPayload = try crypto.seal(Array(packet.payload))
+        let encryptedPayload = try crypto.seal(packet.payload)
         let encryptedPacket = Packet(
             encrypted: true,
             header: packet.header,

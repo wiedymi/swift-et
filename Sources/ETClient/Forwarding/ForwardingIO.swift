@@ -193,7 +193,7 @@ private actor NWForwardingListener: ForwardingListener {
             host: NWEndpoint.Host(host),
             port: networkPort
         )
-        listener = try NWListener(using: parameters, on: networkPort)
+        listener = try NWListener(using: parameters)
     }
 
     func start() async throws {

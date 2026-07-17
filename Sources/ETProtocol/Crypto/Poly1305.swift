@@ -8,25 +8,34 @@ public enum Poly1305 {
         _ message: Message,
         key: Key
     ) throws -> Data {
-        let keyBytes = key.withUnsafeBytes { Array($0) }
-        guard keyBytes.count == keyByteCount else {
-            throw ETProtocolError.invalidKeyLength(
-                expected: keyByteCount,
-                actual: keyBytes.count
-            )
+        try key.withUnsafeBytes { keyBytes in
+            guard keyBytes.count == keyByteCount else {
+                throw ETProtocolError.invalidKeyLength(
+                    expected: keyByteCount,
+                    actual: keyBytes.count
+                )
+            }
+            return message.withUnsafeBytes { messageBytes in
+                var tag = Data(count: tagByteCount)
+                tag.withUnsafeMutableBytes { tagBytes in
+                    authenticate(messageBytes, key: keyBytes, into: tagBytes)
+                }
+                return tag
+            }
         }
-        let messageBytes = message.withUnsafeBytes { Array($0) }
-        return Data(authenticate(messageBytes, key: keyBytes))
     }
 
-    static func authenticate(_ message: [UInt8], key: [UInt8]) -> [UInt8] {
+    static func authenticate(
+        _ message: UnsafeRawBufferPointer,
+        key: UnsafeRawBufferPointer,
+        into tag: UnsafeMutableRawBufferPointer
+    ) {
         let mask26: UInt64 = 0x3ff_ffff
         let r0 = UInt64(load32(key, at: 0)) & 0x3ff_ffff
         let r1 = (UInt64(load32(key, at: 3)) >> 2) & 0x3ff_ff03
         let r2 = (UInt64(load32(key, at: 6)) >> 4) & 0x3ff_c0ff
         let r3 = (UInt64(load32(key, at: 9)) >> 6) & 0x3f0_3fff
         let r4 = (UInt64(load32(key, at: 12)) >> 8) & 0x00f_ffff
-
         let s1 = r1 * 5
         let s2 = r2 * 5
         let s3 = r3 * 5
@@ -38,56 +47,58 @@ public enum Poly1305 {
         var h3: UInt64 = 0
         var h4: UInt64 = 0
 
-        @inline(__always)
-        func process(_ block: [UInt8], at offset: Int, highBit: UInt64) -> (
-            UInt64, UInt64, UInt64, UInt64, UInt64
-        ) {
-            var blockH0 = h0 + (UInt64(load32(block, at: offset)) & mask26)
-            var blockH1 = h1 + ((UInt64(load32(block, at: offset + 3)) >> 2) & mask26)
-            var blockH2 = h2 + ((UInt64(load32(block, at: offset + 6)) >> 4) & mask26)
-            var blockH3 = h3 + ((UInt64(load32(block, at: offset + 9)) >> 6) & mask26)
-            var blockH4 = h4 + ((UInt64(load32(block, at: offset + 12)) >> 8) | highBit)
-
-            let d0 = blockH0 * r0 + blockH1 * s4 + blockH2 * s3 + blockH3 * s2 + blockH4 * s1
-            let d1 = blockH0 * r1 + blockH1 * r0 + blockH2 * s4 + blockH3 * s3 + blockH4 * s2
-            let d2 = blockH0 * r2 + blockH1 * r1 + blockH2 * r0 + blockH3 * s4 + blockH4 * s3
-            let d3 = blockH0 * r3 + blockH1 * r2 + blockH2 * r1 + blockH3 * r0 + blockH4 * s4
-            let d4 = blockH0 * r4 + blockH1 * r3 + blockH2 * r2 + blockH3 * r1 + blockH4 * r0
-
-            var carry = d0 >> 26
-            blockH0 = d0 & mask26
-            var accumulator = d1 + carry
-            carry = accumulator >> 26
-            blockH1 = accumulator & mask26
-            accumulator = d2 + carry
-            carry = accumulator >> 26
-            blockH2 = accumulator & mask26
-            accumulator = d3 + carry
-            carry = accumulator >> 26
-            blockH3 = accumulator & mask26
-            accumulator = d4 + carry
-            carry = accumulator >> 26
-            blockH4 = accumulator & mask26
-            blockH0 += carry * 5
-            carry = blockH0 >> 26
-            blockH0 &= mask26
-            blockH1 += carry
-
-            return (blockH0, blockH1, blockH2, blockH3, blockH4)
-        }
-
         var offset = 0
         while message.count - offset >= 16 {
-            (h0, h1, h2, h3, h4) = process(message, at: offset, highBit: 1 << 24)
+            process(
+                message,
+                at: offset,
+                highBit: 1 << 24,
+                r0: r0,
+                r1: r1,
+                r2: r2,
+                r3: r3,
+                r4: r4,
+                s1: s1,
+                s2: s2,
+                s3: s3,
+                s4: s4,
+                h0: &h0,
+                h1: &h1,
+                h2: &h2,
+                h3: &h3,
+                h4: &h4
+            )
             offset += 16
         }
 
         if offset < message.count {
-            var block = [UInt8](repeating: 0, count: 16)
-            let remaining = message.count - offset
-            block.replaceSubrange(0..<remaining, with: message[offset...])
-            block[remaining] = 1
-            (h0, h1, h2, h3, h4) = process(block, at: 0, highBit: 0)
+            withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 16) { tail in
+                tail.initialize(repeating: 0)
+                let remaining = message.count - offset
+                for index in 0..<remaining {
+                    tail[index] = message[offset + index]
+                }
+                tail[remaining] = 1
+                process(
+                    UnsafeRawBufferPointer(tail),
+                    at: 0,
+                    highBit: 0,
+                    r0: r0,
+                    r1: r1,
+                    r2: r2,
+                    r3: r3,
+                    r4: r4,
+                    s1: s1,
+                    s2: s2,
+                    s3: s3,
+                    s4: s4,
+                    h0: &h0,
+                    h1: &h1,
+                    h2: &h2,
+                    h3: &h3,
+                    h4: &h4
+                )
+            }
         }
 
         var carry = h1 >> 26
@@ -143,16 +154,73 @@ public enum Poly1305 {
         f1 &= 0xffff_ffff
         f2 &= 0xffff_ffff
 
-        var tag = [UInt8](repeating: 0, count: tagByteCount)
-        store32(UInt32(f0), into: &tag, at: 0)
-        store32(UInt32(f1), into: &tag, at: 4)
-        store32(UInt32(f2), into: &tag, at: 8)
-        store32(UInt32(f3 & 0xffff_ffff), into: &tag, at: 12)
-        return tag
+        store32(UInt32(f0), into: tag, at: 0)
+        store32(UInt32(f1), into: tag, at: 4)
+        store32(UInt32(f2), into: tag, at: 8)
+        store32(UInt32(f3 & 0xffff_ffff), into: tag, at: 12)
     }
 
     @inline(__always)
-    private static func load32(_ bytes: [UInt8], at offset: Int) -> UInt32 {
+    private static func process(
+        _ block: UnsafeRawBufferPointer,
+        at offset: Int,
+        highBit: UInt64,
+        r0: UInt64,
+        r1: UInt64,
+        r2: UInt64,
+        r3: UInt64,
+        r4: UInt64,
+        s1: UInt64,
+        s2: UInt64,
+        s3: UInt64,
+        s4: UInt64,
+        h0: inout UInt64,
+        h1: inout UInt64,
+        h2: inout UInt64,
+        h3: inout UInt64,
+        h4: inout UInt64
+    ) {
+        let mask26: UInt64 = 0x3ff_ffff
+        var blockH0 = h0 + (UInt64(load32(block, at: offset)) & mask26)
+        var blockH1 = h1 + ((UInt64(load32(block, at: offset + 3)) >> 2) & mask26)
+        var blockH2 = h2 + ((UInt64(load32(block, at: offset + 6)) >> 4) & mask26)
+        var blockH3 = h3 + ((UInt64(load32(block, at: offset + 9)) >> 6) & mask26)
+        var blockH4 = h4 + ((UInt64(load32(block, at: offset + 12)) >> 8) | highBit)
+
+        let d0 = blockH0 * r0 + blockH1 * s4 + blockH2 * s3 + blockH3 * s2 + blockH4 * s1
+        let d1 = blockH0 * r1 + blockH1 * r0 + blockH2 * s4 + blockH3 * s3 + blockH4 * s2
+        let d2 = blockH0 * r2 + blockH1 * r1 + blockH2 * r0 + blockH3 * s4 + blockH4 * s3
+        let d3 = blockH0 * r3 + blockH1 * r2 + blockH2 * r1 + blockH3 * r0 + blockH4 * s4
+        let d4 = blockH0 * r4 + blockH1 * r3 + blockH2 * r2 + blockH3 * r1 + blockH4 * r0
+
+        var carry = d0 >> 26
+        blockH0 = d0 & mask26
+        var accumulator = d1 + carry
+        carry = accumulator >> 26
+        blockH1 = accumulator & mask26
+        accumulator = d2 + carry
+        carry = accumulator >> 26
+        blockH2 = accumulator & mask26
+        accumulator = d3 + carry
+        carry = accumulator >> 26
+        blockH3 = accumulator & mask26
+        accumulator = d4 + carry
+        carry = accumulator >> 26
+        blockH4 = accumulator & mask26
+        blockH0 += carry * 5
+        carry = blockH0 >> 26
+        blockH0 &= mask26
+        blockH1 += carry
+
+        h0 = blockH0
+        h1 = blockH1
+        h2 = blockH2
+        h3 = blockH3
+        h4 = blockH4
+    }
+
+    @inline(__always)
+    private static func load32(_ bytes: UnsafeRawBufferPointer, at offset: Int) -> UInt32 {
         UInt32(bytes[offset])
             | (UInt32(bytes[offset + 1]) << 8)
             | (UInt32(bytes[offset + 2]) << 16)
@@ -160,7 +228,11 @@ public enum Poly1305 {
     }
 
     @inline(__always)
-    private static func store32(_ value: UInt32, into bytes: inout [UInt8], at offset: Int) {
+    private static func store32(
+        _ value: UInt32,
+        into bytes: UnsafeMutableRawBufferPointer,
+        at offset: Int
+    ) {
         bytes[offset] = UInt8(truncatingIfNeeded: value)
         bytes[offset + 1] = UInt8(truncatingIfNeeded: value >> 8)
         bytes[offset + 2] = UInt8(truncatingIfNeeded: value >> 16)

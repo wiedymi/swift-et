@@ -42,6 +42,17 @@ let package = Package(
                 .enableUpcomingFeature("StrictConcurrency"),
             ]
         ),
+        .executableTarget(
+            name: "Benchmarks",
+            dependencies: [
+                "ETProtocol",
+                .product(name: "Sodium", package: "swift-sodium"),
+            ],
+            path: "Benchmarks",
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
         .testTarget(
             name: "ETProtocolTests",
             dependencies: [
@@ -59,6 +70,15 @@ let package = Package(
                 "ETClient",
                 "ETProtocol",
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .testTarget(
+            name: "ETIntegrationTests",
+            dependencies: [
+                "ETClient",
             ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
