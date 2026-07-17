@@ -10,6 +10,7 @@ let package = Package(
     ],
     products: [
         .library(name: "ETProtocol", targets: ["ETProtocol"]),
+        .library(name: "ETClient", targets: ["ETClient"]),
     ],
     dependencies: [
         .package(
@@ -31,11 +32,32 @@ let package = Package(
                 .enableUpcomingFeature("StrictConcurrency"),
             ]
         ),
+        .target(
+            name: "ETClient",
+            dependencies: [
+                "ETProtocol",
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
         .testTarget(
             name: "ETProtocolTests",
             dependencies: [
                 "ETProtocol",
                 .product(name: "Sodium", package: "swift-sodium"),
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .testTarget(
+            name: "ETClientTests",
+            dependencies: [
+                "ETClient",
+                "ETProtocol",
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
             swiftSettings: [
