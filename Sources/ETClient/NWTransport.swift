@@ -121,8 +121,11 @@ actor NWTransport: Transport {
         case .ready:
             updateState(.ready)
             resumeConnect()
-        case .waiting:
+        case .waiting(let message):
             updateState(.waiting)
+            guard connectContinuation != nil else { return }
+            connection?.cancel()
+            resumeConnect(throwing: TransportError.failed(message))
         case .failed(let message):
             updateState(.failed(message))
             resumeConnect(throwing: TransportError.failed(message))

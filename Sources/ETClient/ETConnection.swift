@@ -29,6 +29,7 @@ public enum ETConnectionState: Equatable, Sendable {
 
 struct ETConnectionConfiguration: Sendable {
     var reconnectDelay: Duration = .seconds(1)
+    var connectTimeout: Duration = .seconds(5)
     var initializationTimeout: Duration = .seconds(3)
     var keepAliveInterval: Duration = .seconds(5)
 }
@@ -57,6 +58,7 @@ actor ETConnection {
     private var stateTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
+    private var writeDrainTask: Task<Void, Never>?
     private var waitingOnKeepAlive = false
     private var isClosed = false
     private var pendingWrites: [PendingWrite] = []
@@ -102,7 +104,7 @@ actor ETConnection {
         pendingTransport = newTransport
 
         do {
-            try await newTransport.connect(to: endpoint)
+            try await connect(newTransport)
             var framingBuffer = Data()
             let response = try await exchangeConnectRequest(
                 over: newTransport,
@@ -166,10 +168,12 @@ actor ETConnection {
         stateTask?.cancel()
         reconnectTask?.cancel()
         heartbeatTask?.cancel()
+        writeDrainTask?.cancel()
         readTask = nil
         stateTask = nil
         reconnectTask = nil
         heartbeatTask = nil
+        writeDrainTask = nil
 
         await reader?.invalidate()
         await writer?.invalidate()
@@ -329,13 +333,18 @@ actor ETConnection {
         guard receivedGeneration == generation, !isClosed, let reader else { return }
         do {
             let receivedPackets = try await reader.receive(bytes)
-            guard receivedGeneration == generation, state == .connected else { return }
+            guard !isClosed else { return }
+            let isCurrentConnection = receivedGeneration == generation && state == .connected
             for packet in receivedPackets {
                 if packet.header == UInt8(Et_TerminalPacketType.keepAlive.rawValue)
                     || packet.header == UInt8(Et_EtPacketType.heartbeat.rawValue) {
-                    waitingOnKeepAlive = false
+                    if isCurrentConnection {
+                        waitingOnKeepAlive = false
+                    }
                 } else {
-                    startHeartbeat(generation: receivedGeneration)
+                    if isCurrentConnection {
+                        startHeartbeat(generation: receivedGeneration)
+                    }
                     packetContinuation.yield(packet)
                 }
             }
@@ -379,7 +388,7 @@ actor ETConnection {
     private func startWriteDrainIfNeeded() {
         guard !isRecovering, !isDrainingWrites, !pendingWrites.isEmpty else { return }
         isDrainingWrites = true
-        Task { [weak self] in
+        writeDrainTask = Task { [weak self] in
             await self?.drainWrites()
         }
     }
@@ -418,6 +427,7 @@ actor ETConnection {
             }
         }
         isDrainingWrites = false
+        writeDrainTask = nil
         let waiters = writeDrainWaiters
         writeDrainWaiters.removeAll()
         for waiter in waiters {
@@ -488,7 +498,7 @@ actor ETConnection {
         let newTransport = await transportFactory.makeTransport()
         pendingTransport = newTransport
         do {
-            try await newTransport.connect(to: endpoint)
+            try await connect(newTransport)
             var framingBuffer = Data()
             let response = try await exchangeConnectRequest(
                 over: newTransport,
@@ -529,13 +539,23 @@ actor ETConnection {
             pendingTransport = nil
             activate(newTransport)
         } catch {
-            isRecovering = false
+            let clientError = mapError(error)
+            let isPermanentFailure: Bool
+            switch clientError {
+            case .invalidKey, .mismatchedProtocol:
+                isPermanentFailure = true
+            default:
+                isPermanentFailure = false
+            }
+            isRecovering = isPermanentFailure
             pendingTransport = nil
             await reader.invalidate()
             await writer.invalidate()
-            startWriteDrainIfNeeded()
+            if !isPermanentFailure {
+                startWriteDrainIfNeeded()
+            }
             await newTransport.close()
-            throw mapError(error)
+            throw clientError
         }
     }
 
@@ -548,9 +568,75 @@ actor ETConnection {
 
     private func failPermanently(_ error: ETClientError) async {
         guard !isClosed else { return }
+        isClosed = true
+        generation &+= 1
+        readTask?.cancel()
+        stateTask?.cancel()
+        reconnectTask?.cancel()
+        heartbeatTask?.cancel()
+        writeDrainTask?.cancel()
+        readTask = nil
+        stateTask = nil
         reconnectTask = nil
+        heartbeatTask = nil
+        writeDrainTask = nil
+        isRecovering = false
+        isDrainingWrites = false
+
+        await reader?.invalidate()
+        await writer?.invalidate()
+        let currentTransport = transport
+        transport = nil
+        let currentPendingTransport = pendingTransport
+        pendingTransport = nil
+        await currentTransport?.close()
+        await currentPendingTransport?.close()
+
+        let writes = pendingWrites
+        pendingWrites.removeAll()
+        for write in writes {
+            write.continuation.resume(throwing: ETClientError.connectionClosed)
+        }
+        let waiters = writeDrainWaiters
+        writeDrainWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
         updateState(.failed(error))
         packetContinuation.finish()
+        stateContinuation.finish()
+    }
+
+    private func connect(_ newTransport: any Transport) async throws {
+        enum Outcome: Sendable {
+            case connected
+            case timedOut
+        }
+
+        let endpoint = endpoint
+        let timeout = configuration.connectTimeout
+        try await withThrowingTaskGroup(of: Outcome.self) { group in
+            group.addTask {
+                try await newTransport.connect(to: endpoint)
+                return .connected
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                return .timedOut
+            }
+
+            guard let outcome = try await group.next() else {
+                throw ETClientError.transportFailure("Transport connect race ended unexpectedly")
+            }
+            group.cancelAll()
+            switch outcome {
+            case .connected:
+                return
+            case .timedOut:
+                await newTransport.close()
+                throw ETClientError.transportFailure("Transport connect timed out")
+            }
+        }
     }
 
     private func writeProto<Message: SwiftProtobuf.Message>(
@@ -562,6 +648,8 @@ actor ETConnection {
             throw ETClientError.malformedFrame("Protobuf payload exceeds 128 MiB")
         }
         var framed = Data(capacity: 8 + payload.count)
+        // The 8-byte length prefix is little-endian, matching the C++ reference's raw
+        // host-order int64 (SocketHandler.hpp) on every platform supported here.
         let length = UInt64(payload.count)
         for byteIndex in 0..<8 {
             framed.append(UInt8(truncatingIfNeeded: length >> UInt64(byteIndex * 8)))

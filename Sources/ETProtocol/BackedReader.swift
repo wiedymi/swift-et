@@ -85,6 +85,8 @@ public actor BackedReader {
     }
 
     public func sequenceHeader() throws -> Et_SequenceHeader {
+        // The wire field is int32, a protocol limitation shared with C++; Swift throws
+        // past Int32.max here, whereas the C++ implementation silently wraps.
         guard let wireSequenceNumber = Int32(exactly: sequenceNumber) else {
             throw ETProtocolError.sequenceNumberOutOfRange
         }

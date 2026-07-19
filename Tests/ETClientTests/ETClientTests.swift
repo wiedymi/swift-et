@@ -115,6 +115,135 @@ final class ETClientTests: XCTestCase {
         await session.close()
     }
 
+    func testReconnectDoesNotLosePacketsDecodedDuringFailure() async throws {
+        let readGate = TestPauseGate(armed: false)
+        let server = FakeETServer()
+        let factory = ControlledTransportFactory(server: server, firstReadGate: readGate)
+        let session = try makeSession(
+            server: server,
+            transportFactory: factory,
+            reconnectDelay: .milliseconds(5),
+            keepAliveInterval: .seconds(10)
+        )
+        let outputCollector = OutputCollector()
+        let outputTask = Task {
+            for await bytes in session.output {
+                await outputCollector.append(bytes)
+            }
+        }
+        defer { outputTask.cancel() }
+
+        try await session.connect()
+        await readGate.arm()
+        let first = Data(repeating: 0x41, count: 2 * 1024 * 1024)
+        let second = Data(repeating: 0x42, count: 2 * 1024 * 1024)
+        try await server.sendTerminalOutputsUnchunked([first, second])
+        await readGate.waitUntilPaused()
+        await readGate.release()
+        try await Task.sleep(for: .milliseconds(5))
+        await server.disconnectClient()
+
+        try await eventually(timeout: .seconds(5)) {
+            await outputCollector.values().count == 2
+        }
+        try await eventually(timeout: .seconds(5)) {
+            await server.snapshot().connectionCount >= 2
+        }
+        let collectedOutput = await outputCollector.values()
+        let reconnectClientSequences = await server.snapshot().reconnectClientSequences
+        XCTAssertEqual(collectedOutput, [first, second])
+        XCTAssertEqual(reconnectClientSequences.last, 3)
+        await session.close()
+    }
+
+    func testConnectTimeoutAndReconnectRetryDoNotHangOnWaitingTransport() async throws {
+        let initialFactory = WaitingOnlyTransportFactory()
+        let initialConnection = try ETConnection(
+            endpoint: TransportEndpoint(host: "waiting", port: 2022),
+            clientID: "test-client",
+            passkey: key,
+            transportFactory: initialFactory,
+            configuration: ETConnectionConfiguration(connectTimeout: .milliseconds(20))
+        )
+
+        do {
+            try await initialConnection.connect(initialPayload: Et_InitialPayload())
+            XCTFail("Expected connect timeout")
+        } catch {
+            guard case .transportFailure = error as? ETClientError else {
+                return XCTFail("Expected transportFailure, got \(error)")
+            }
+        }
+        let initialMakeCount = await initialFactory.makeCount()
+        XCTAssertEqual(initialMakeCount, 1)
+
+        let server = FakeETServer()
+        let reconnectFactory = ControlledTransportFactory(
+            server: server,
+            waitOnConnectionNumber: 2
+        )
+        let session = try makeSession(
+            server: server,
+            transportFactory: reconnectFactory,
+            reconnectDelay: .seconds(1),
+            connectTimeout: .milliseconds(20),
+            keepAliveInterval: .seconds(10)
+        )
+        try await session.connect()
+        await server.disconnectClient()
+
+        try await eventually(timeout: .seconds(3)) {
+            await reconnectFactory.makeCount() >= 3
+        }
+        await session.close()
+    }
+
+    func testPermanentReconnectFailureFullyTearsDownConnection() async throws {
+        let reconnectGate = TestPauseGate()
+        let server = FakeETServer(
+            acceptance: .rejectReconnect(.invalidKey, "revoked passkey"),
+            reconnectResponseGate: reconnectGate
+        )
+        let session = try makeSession(
+            server: server,
+            reconnectDelay: .milliseconds(5),
+            keepAliveInterval: .seconds(10)
+        )
+        let stateTask = Task {
+            var states: [ETConnectionState] = []
+            for await state in session.stateChanges {
+                states.append(state)
+            }
+            return states
+        }
+
+        try await session.connect()
+        await server.disconnectClient()
+        await reconnectGate.waitUntilPaused()
+        let pendingSend = Task {
+            try await session.send(Data("pending".utf8))
+        }
+        await Task.yield()
+        await reconnectGate.release()
+
+        do {
+            try await pendingSend.value
+            XCTFail("Expected pending send to fail")
+        } catch {
+            XCTAssertEqual(error as? ETClientError, .connectionClosed)
+        }
+        let states = await stateTask.value
+        XCTAssertEqual(states.last, .failed(.invalidKey("revoked passkey")))
+
+        do {
+            try await session.send(Data("after failure".utf8))
+            XCTFail("Expected send after permanent failure to fail")
+        } catch {
+            XCTAssertEqual(error as? ETClientError, .connectionClosed)
+        }
+        await session.close()
+    }
+
     func testHeartbeatUsesTerminalKeepAliveCadence() async throws {
         let server = FakeETServer(echoKeepAlives: true)
         let session = try makeSession(
@@ -395,7 +524,9 @@ final class ETClientTests: XCTestCase {
         reverseTunnels: [ETTunnel] = [],
         jumphost: Bool = false,
         forwardingNetwork: InMemoryForwardingNetwork? = nil,
+        transportFactory: (any TransportFactory)? = nil,
         reconnectDelay: Duration = .milliseconds(10),
+        connectTimeout: Duration = .seconds(5),
         keepAliveInterval: Duration = .seconds(1)
     ) throws -> ETTerminalSession {
         let listenerFactory: any ForwardingListenerFactory
@@ -415,9 +546,10 @@ final class ETClientTests: XCTestCase {
             reverseTunnels: reverseTunnels,
             jumphost: jumphost,
             environmentVariables: ["TERM": "xterm-256color"],
-            transportFactory: InMemoryTransportFactory(server: server),
+            transportFactory: transportFactory ?? InMemoryTransportFactory(server: server),
             configuration: ETConnectionConfiguration(
                 reconnectDelay: reconnectDelay,
+                connectTimeout: connectTimeout,
                 initializationTimeout: .seconds(1),
                 keepAliveInterval: keepAliveInterval
             ),
@@ -469,6 +601,7 @@ private struct ServerSnapshot: Sendable {
     let reverseData: [Data]
     let forwardSocketID: Int32?
     let reverseSocketID: Int32?
+    let reconnectClientSequences: [Int32]
 }
 
 private actor OutputCollector {
@@ -486,6 +619,7 @@ private actor OutputCollector {
 private enum ServerAcceptance: Sendable {
     case normal
     case reject(Et_ConnectStatus, String)
+    case rejectReconnect(Et_ConnectStatus, String)
 }
 
 private enum ServerPhase: Sendable {
@@ -505,6 +639,7 @@ private protocol InMemoryClientSink: Sendable {
 private actor FakeETServer {
     private let acceptance: ServerAcceptance
     private let echoKeepAlives: Bool
+    private let reconnectResponseGate: TestPauseGate?
     private let responseChunkSizes = [1, 2, 5, 3, 8]
     private let key = Data((0..<32).map(UInt8.init))
 
@@ -526,13 +661,16 @@ private actor FakeETServer {
     private var reverseSocketID: Int32?
     private var forwardData: [Data] = []
     private var reverseData: [Data] = []
+    private var reconnectClientSequences: [Int32] = []
 
     init(
         acceptance: ServerAcceptance = .normal,
-        echoKeepAlives: Bool = true
+        echoKeepAlives: Bool = true,
+        reconnectResponseGate: TestPauseGate? = nil
     ) {
         self.acceptance = acceptance
         self.echoKeepAlives = echoKeepAlives
+        self.reconnectResponseGate = reconnectResponseGate
     }
 
     func accept(_ newSink: any InMemoryClientSink) -> Int {
@@ -595,6 +733,25 @@ private actor FakeETServer {
         }
     }
 
+    func sendTerminalOutputsUnchunked(_ payloads: [Data]) async throws {
+        var framedPackets = Data()
+        for payload in payloads {
+            var terminalBuffer = Et_TerminalBuffer()
+            terminalBuffer.buffer = payload
+            framedPackets.append(
+                try await makeServerPacket(
+                    header: UInt8(Et_TerminalPacketType.terminalBuffer.rawValue),
+                    payload: terminalBuffer.serializedData()
+                )
+            )
+        }
+        await sink?.deliver(framedPackets)
+    }
+
+    func disconnectClient() async {
+        await disconnectCurrentConnection()
+    }
+
     func requestReverseDestination(_ endpoint: Et_SocketEndpoint) async throws {
         var request = Et_PortForwardDestinationRequest()
         request.destination = endpoint
@@ -645,7 +802,8 @@ private actor FakeETServer {
             forwardData: forwardData,
             reverseData: reverseData,
             forwardSocketID: forwardSocketIDs.first,
-            reverseSocketID: reverseSocketID
+            reverseSocketID: reverseSocketID,
+            reconnectClientSequences: reconnectClientSequences
         )
     }
 
@@ -660,7 +818,7 @@ private actor FakeETServer {
                 response.status = status
                 response.error = message
                 phase = .rejected
-            case .normal:
+            case .normal, .rejectReconnect(_, _):
                 if reader == nil || writer == nil {
                     response.status = .newClient
                     reader = try BackedReader(
@@ -673,8 +831,15 @@ private actor FakeETServer {
                     )
                     phase = .initialPayload
                 } else {
-                    response.status = .returningClient
-                    phase = .clientSequence
+                    if case .rejectReconnect(let status, let message) = acceptance {
+                        await reconnectResponseGate?.pause()
+                        response.status = status
+                        response.error = message
+                        phase = .rejected
+                    } else {
+                        response.status = .returningClient
+                        phase = .clientSequence
+                    }
                 }
             }
             await deliverChunked(try frameProto(response))
@@ -693,6 +858,7 @@ private actor FakeETServer {
 
         case .clientSequence:
             guard let clientSequence = try takeProto(Et_SequenceHeader.self) else { return }
+            reconnectClientSequences.append(clientSequence.sequenceNumber)
             guard let reader else { throw TransportError.connectionClosed }
             let serverSequence = try await reader.sequenceHeader()
             phase = .clientCatchup(clientSequence: Int64(clientSequence.sequenceNumber))
@@ -881,6 +1047,140 @@ private actor FakeETServer {
     }
 }
 
+private actor TestPauseGate {
+    private var isArmed: Bool
+    private var isPaused = false
+    private var pauseWaiter: CheckedContinuation<Void, Never>?
+    private var observers: [CheckedContinuation<Void, Never>] = []
+
+    init(armed: Bool = true) {
+        isArmed = armed
+    }
+
+    func arm() {
+        isArmed = true
+    }
+
+    func pause() async {
+        guard isArmed else { return }
+        isArmed = false
+        isPaused = true
+        let currentObservers = observers
+        observers.removeAll()
+        for observer in currentObservers {
+            observer.resume()
+        }
+        await withCheckedContinuation { continuation in
+            pauseWaiter = continuation
+        }
+        isPaused = false
+    }
+
+    func waitUntilPaused() async {
+        guard !isPaused else { return }
+        await withCheckedContinuation { continuation in
+            observers.append(continuation)
+        }
+    }
+
+    func release() {
+        let waiter = pauseWaiter
+        pauseWaiter = nil
+        waiter?.resume()
+    }
+}
+
+private actor WaitingOnlyTransportFactory: TransportFactory {
+    private var count = 0
+
+    func makeTransport() -> any Transport {
+        count += 1
+        return WaitingTransport()
+    }
+
+    func makeCount() -> Int {
+        count
+    }
+}
+
+private actor ControlledTransportFactory: TransportFactory {
+    private let server: FakeETServer
+    private let firstReadGate: TestPauseGate?
+    private let waitOnConnectionNumber: Int?
+    private var count = 0
+
+    init(
+        server: FakeETServer,
+        firstReadGate: TestPauseGate? = nil,
+        waitOnConnectionNumber: Int? = nil
+    ) {
+        self.server = server
+        self.firstReadGate = firstReadGate
+        self.waitOnConnectionNumber = waitOnConnectionNumber
+    }
+
+    func makeTransport() -> any Transport {
+        count += 1
+        if count == waitOnConnectionNumber {
+            return WaitingTransport()
+        }
+        return InMemoryTransport(
+            server: server,
+            readGate: count == 1 ? firstReadGate : nil
+        )
+    }
+
+    func makeCount() -> Int {
+        count
+    }
+}
+
+private actor WaitingTransport: Transport {
+    nonisolated let stateChanges: AsyncStream<TransportState>
+
+    private let stateContinuation: AsyncStream<TransportState>.Continuation
+    private var connectContinuation: CheckedContinuation<Void, any Error>?
+    private var isClosed = false
+
+    init() {
+        let pair = AsyncStream<TransportState>.makeStream(
+            bufferingPolicy: .bufferingNewest(8)
+        )
+        stateChanges = pair.stream
+        stateContinuation = pair.continuation
+        stateContinuation.yield(.idle)
+    }
+
+    func connect(to endpoint: TransportEndpoint) async throws {
+        _ = endpoint
+        guard !isClosed else { throw TransportError.connectionClosed }
+        stateContinuation.yield(.connecting)
+        stateContinuation.yield(.waiting)
+        try await withCheckedThrowingContinuation { continuation in
+            connectContinuation = continuation
+        }
+    }
+
+    func read() async throws -> Data {
+        throw TransportError.connectionClosed
+    }
+
+    func write(_ data: Data) async throws {
+        _ = data
+        throw TransportError.connectionClosed
+    }
+
+    func close() {
+        guard !isClosed else { return }
+        isClosed = true
+        let continuation = connectContinuation
+        connectContinuation = nil
+        continuation?.resume(throwing: TransportError.connectionClosed)
+        stateContinuation.yield(.closed)
+        stateContinuation.finish()
+    }
+}
+
 private struct InMemoryTransportFactory: TransportFactory {
     let server: FakeETServer
 
@@ -894,12 +1194,14 @@ private actor InMemoryTransport: Transport, InMemoryClientSink {
 
     private let stateContinuation: AsyncStream<TransportState>.Continuation
     private let server: FakeETServer
+    private let readGate: TestPauseGate?
     private let incoming = AsyncDataQueue()
     private var connectionID: Int?
     private var isOpen = false
 
-    init(server: FakeETServer) {
+    init(server: FakeETServer, readGate: TestPauseGate? = nil) {
         self.server = server
+        self.readGate = readGate
         let pair = AsyncStream<TransportState>.makeStream(
             bufferingPolicy: .bufferingNewest(8)
         )
@@ -918,7 +1220,9 @@ private actor InMemoryTransport: Transport, InMemoryClientSink {
 
     func read() async throws -> Data {
         guard isOpen else { throw TransportError.connectionClosed }
-        return try await incoming.next()
+        let data = try await incoming.next()
+        await readGate?.pause()
+        return data
     }
 
     func write(_ data: Data) async throws {
