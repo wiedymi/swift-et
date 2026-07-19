@@ -1,6 +1,9 @@
+import ETCrypto
 import Foundation
 
+/// Decrypts framed packets while tracking reliable-stream sequence numbers.
 public actor BackedReader {
+    /// Maximum frame size representable by the C++ protocol.
     public static let maximumFrameBytes = Int(Int32.max)
 
     private var crypto: SecretBoxState
@@ -10,6 +13,7 @@ public actor BackedReader {
     private var localBufferIndex = 0
     private var partialMessage = Data()
 
+    /// Creates a reader for one directional nonce stream.
     public init<Key: ContiguousBytes & Sendable>(
         key: Key,
         nonceMostSignificantByte: UInt8,
@@ -22,6 +26,7 @@ public actor BackedReader {
         isConnected = connected
     }
 
+    /// Consumes bytes and returns every complete decrypted packet in order.
     public func receive(_ bytes: Data = Data()) throws -> [Packet] {
         guard isConnected else { return [] }
         var packets: [Packet] = []
@@ -64,10 +69,12 @@ public actor BackedReader {
         return packets
     }
 
+    /// Marks the reader disconnected without discarding its sequence state.
     public func invalidate() {
         isConnected = false
     }
 
+    /// Restores a disconnected reader with original serialized ciphertext packets.
     public func revive(with recoveredSerializedPackets: [Data]) throws {
         partialMessage.removeAll(keepingCapacity: true)
         if localBufferIndex > 0 {
@@ -84,6 +91,7 @@ public actor BackedReader {
         isConnected = true
     }
 
+    /// Returns the latest received sequence number for the recovery handshake.
     public func sequenceHeader() throws -> Et_SequenceHeader {
         // The wire field is int32, a protocol limitation shared with C++; Swift throws
         // past Int32.max here, whereas the C++ implementation silently wraps.
@@ -95,10 +103,12 @@ public actor BackedReader {
         return header
     }
 
+    /// Returns the full-width local sequence number.
     public func currentSequenceNumber() -> Int64 {
         sequenceNumber
     }
 
+    /// Indicates whether recovery ciphertext remains to be delivered.
     public func hasRecoveredPackets() -> Bool {
         localBufferIndex < localBuffer.count
     }

@@ -1,11 +1,15 @@
 import Foundation
 
+/// A serialized secretbox stream with Eternal Terminal nonce semantics.
 public actor SecretBox {
+    /// Nonce stream discriminator used for client-to-server packets.
     public static let clientToServerNonceMostSignificantByte: UInt8 = 0
+    /// Nonce stream discriminator used for server-to-client packets.
     public static let serverToClientNonceMostSignificantByte: UInt8 = 1
 
     private var state: SecretBoxState
 
+    /// Creates a secretbox stream from a 32-byte key and direction discriminator.
     public init<Key: ContiguousBytes & Sendable>(
         key: Key,
         nonceMostSignificantByte: UInt8
@@ -16,37 +20,41 @@ public actor SecretBox {
         )
     }
 
+    /// Increments the nonce and encrypts one message.
     public func seal<Message: ContiguousBytes & Sendable>(_ message: Message) throws -> Data {
         try state.seal(message)
     }
 
+    /// Increments the nonce and authenticates one ciphertext.
     public func open<Ciphertext: ContiguousBytes & Sendable>(_ ciphertext: Ciphertext) throws -> Data {
         try state.open(ciphertext)
     }
 }
 
-struct SecretBoxState: Sendable {
-    private let key: [UInt8]
+package struct SecretBoxState: Sendable {
+    private let key: SecretKey
     private var nonce: [UInt8]
 
-    init(key: [UInt8], nonceMostSignificantByte: UInt8) throws {
+    package init(key: [UInt8], nonceMostSignificantByte: UInt8) throws {
         guard key.count == XSalsa20Poly1305.keyByteCount else {
             throw ETProtocolError.invalidKeyLength(
                 expected: XSalsa20Poly1305.keyByteCount,
                 actual: key.count
             )
         }
-        self.key = key
+        self.key = SecretKey(key)
         nonce = [UInt8](repeating: 0, count: XSalsa20Poly1305.nonceByteCount)
         nonce[XSalsa20Poly1305.nonceByteCount - 1] = nonceMostSignificantByte
     }
 
-    mutating func seal<Message: ContiguousBytes>(_ message: Message) throws -> Data {
+    package mutating func seal<Message: ContiguousBytes>(_ message: Message) throws -> Data {
         incrementNonce()
         return try XSalsa20Poly1305.seal(message, nonce: nonce, key: key)
     }
 
-    mutating func open<Ciphertext: ContiguousBytes>(_ ciphertext: Ciphertext) throws -> Data {
+    package mutating func open<Ciphertext: ContiguousBytes>(
+        _ ciphertext: Ciphertext
+    ) throws -> Data {
         incrementNonce()
         return try XSalsa20Poly1305.open(ciphertext, nonce: nonce, key: key)
     }

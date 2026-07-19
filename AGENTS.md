@@ -25,7 +25,7 @@ Key reference files:
 ## Locked decisions (do not relitigate)
 
 - **Client only.** No `etserver`, no `etterminal` equivalents.
-- **SSH bootstrap is out of scope.** The library takes `host`, `port`, `clientId`, `passkey` as input. The consuming app performs the SSH-side exchange itself. Do not add an SSH dependency.
+- **SSH implementation is out of scope; injected bootstrap is in scope.** The library generates the `etterminal` launch command and parses its credentials through a consumer-provided executor. Do not add an SSH dependency.
 - **Networking: Network.framework** (`NWConnection`). Apple platforms only: macOS 13+, iOS 16+. Wrap it behind a small internal `Transport` protocol so an NIO transport can be added later without API changes.
 - **Crypto: pure Swift** XSalsa20-Poly1305 implementation inside this package (Salsa20 core, HSalsa20 key derivation, Poly1305 MAC), byte-compatible with libsodium `crypto_secretbox_easy`/`crypto_secretbox_open_easy`. No runtime crypto dependency. Performance is a requirement, not an afterthought — see Benchmarks below. `swift-sodium` may appear **only** as a dependency of test/benchmark targets (cross-validation oracle), never of library products.
 - **Runtime dependencies: swift-protobuf only.** Nothing else in the product dependency graph.
@@ -36,21 +36,24 @@ Key reference files:
 ```
 Package.swift              swift-tools-version 6.0+, strict concurrency
 Sources/
-  ETProtocol/              Pure logic, no I/O, no Network.framework import
+  ETCrypto/                XSalsa20Poly1305, Poly1305, SecretBox; no dependencies
+  ETCore/                  depends on ETCrypto + swift-protobuf
     Proto/                 Checked-in generated *.pb.swift from refs proto files
-    Crypto/                XSalsa20Poly1305, SecretBox (nonce management per CryptoHandler)
     Packet.swift           Packet model + wire serialization
     BackedReader.swift     \  sequence numbers, backup buffer,
     BackedWriter.swift     /  catchup logic — mirror C++ semantics exactly
-  ETClient/                depends on ETProtocol
+  ETTransport/             transport abstraction and Network.framework implementation
     Transport.swift        protocol Transport (async read/write/close)
     NWTransport.swift      Network.framework implementation
+  ETBootstrap/             injected etterminal command generation + credential parsing
+  ETSession/               depends on ETCore, ETCrypto, ETTransport, ETBootstrap
     ETConnection.swift     actor: connect/reconnect/resume state machine, heartbeats
     ETTerminalSession.swift public API: AsyncStream<Data> output, send(_:), resize(rows:cols:)
     Forwarding/            port-forward routing (source/destination handlers)
 Tests/
-  ETProtocolTests/         vectors, round-trips, catchup simulations
-  ETClientTests/           state machine tests with in-memory Transport
+  ETCoreTests/             vectors, round-trips, catchup simulations
+  ETBootstrapTests/        bootstrap command and parser tests
+  ETSessionTests/          state machine tests with in-memory Transport
   ETIntegrationTests/      against a real etserver (skipped unless ET_INTEGRATION=1)
 Benchmarks/                crypto + framing throughput; swift-sodium as oracle/baseline
 refs/EternalTerminal/      submodule, reference only
@@ -87,7 +90,7 @@ Generated protobuf Swift files are **checked in** (regenerate with `scripts/gen-
 ## Roadmap
 
 1. Scaffold: Package.swift, targets, checked-in generated protobufs, CI-less local build green.
-2. `ETProtocol`: crypto (+vectors), Packet framing, BackedReader/Writer (+catchup tests).
-3. `ETClient`: Transport, NWTransport, ETConnection handshake/resume/heartbeat, ETTerminalSession API.
+2. `ETCrypto` + `ETCore`: crypto (+vectors), Packet framing, BackedReader/Writer (+catchup tests).
+3. `ETTransport` + `ETSession`: transport, ETConnection handshake/resume/heartbeat, ETTerminalSession API.
 4. Forwarding + jumphost.
 5. Benchmarks + integration harness.

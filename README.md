@@ -8,7 +8,7 @@
 
 Pure Swift Eternal Terminal (ET) protocol client for Apple platforms.
 
-This library implements the client side of the [Eternal Terminal](https://github.com/MisterTea/EternalTerminal) wire protocol (protocol version 6): encrypted transport, reconnect/resume, terminal I/O, and port forwarding. The server, the SSH bootstrap that exchanges credentials, and terminal UI/rendering are intentionally out of scope so consumers can integrate with any SSH stack and any renderer.
+This library implements the client side of the [Eternal Terminal](https://github.com/MisterTea/EternalTerminal) wire protocol (protocol version 6): bootstrap command generation/parsing, encrypted transport, reconnect/resume, terminal I/O, and port forwarding. The server, an SSH implementation, and terminal UI/rendering are intentionally out of scope so consumers can integrate their preferred SSH stack and renderer.
 
 ## Features
 
@@ -16,10 +16,14 @@ This library implements the client side of the [Eternal Terminal](https://github
 - Pure Swift XSalsa20-Poly1305, byte-compatible with libsodium `crypto_secretbox` — no runtime crypto dependency
 - Seamless reconnection: sequence-numbered packet backup with ciphertext catchup replay, so sessions survive network drops with no data loss
 - Terminal session API: async/await, `AsyncStream` output, keystroke input, window resize
+- SSH bootstrap adapter with bring-your-own-SSH execution
 - Forward and reverse port tunnels, port ranges, Unix sockets, jumphost support
 - Split modules:
-  - `ETProtocol` — packets, framing, crypto, reliability layer (pure logic, no I/O)
-  - `ETClient` — Network.framework transport, connection state machine, session API
+  - `ETCrypto` — pure Swift XSalsa20-Poly1305 and nonce management
+  - `ETCore` — protobuf messages, packets, framing, and reliable catchup
+  - `ETTransport` — internal transport abstraction and Network.framework implementation
+  - `ETBootstrap` — injected `etterminal` launch command and credential parser
+  - `ETSession` — connection lifecycle, terminal API, forwarding, and jumphost support
 - Real local `etserver` E2E test harness
 - Release-mode benchmarks with a libsodium baseline
 
@@ -35,28 +39,34 @@ Add to `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/wiedymi/swift-et", from: "0.1.0")
+    .package(url: "https://github.com/wiedymi/swift-et", from: "0.1.1")
 ]
 ```
 
-Then add `ETClient` to your target dependencies:
+Then add `ETSession` and `ETBootstrap` to your app target dependencies:
 
 ```swift
 .target(
     name: "YourApp",
     dependencies: [
-        .product(name: "ETClient", package: "swift-et")
+        .product(name: "ETSession", package: "swift-et"),
+        .product(name: "ETBootstrap", package: "swift-et")
     ]
 )
 ```
 
 ## Usage
 
-The library takes a host, port, client id, and 32-byte passkey. Your app is responsible for delivering the id/passkey pair to the server out-of-band (the same exchange `et` performs over SSH by running `etterminal`).
+Apps normally import the session and bootstrap surfaces:
 
 ```swift
-import ETClient
+import ETBootstrap
+import ETSession
+```
 
+You can supply credentials acquired out of band:
+
+```swift
 let session = try ETTerminalSession(
     host: "example.com",
     port: 2022,
@@ -73,7 +83,39 @@ Task {
 }
 
 try await session.send(Data("ls -la\n".utf8))
-try await session.resize(rows: 40, cols: 120)
+try await session.resize(
+    rows: 40,
+    cols: 120,
+    pixelWidth: 1440,
+    pixelHeight: 900
+)
+```
+
+## Bootstrap
+
+`ETBootstrap` mirrors the C++ client's `etterminal` command and `IDPASSKEY:` parser. The
+library never opens SSH itself; inject your existing SSH client:
+
+```swift
+struct AppSSHExecutor: ETBootstrapExecutor {
+    let ssh: MySSHClient
+
+    func run(command: String) async throws -> String {
+        try await ssh.run(command, captureOutput: true)
+    }
+}
+
+let session = ETTerminalSession(
+    host: "example.com",
+    port: 2022,
+    bootstrapExecutor: AppSSHExecutor(ssh: ssh),
+    bootstrapOptions: ETBootstrapOptions(
+        term: "xterm-256color",
+        serverFifo: "/tmp/etserver.fifo"
+    )
+)
+
+try await session.connect()
 ```
 
 Port forwarding:
@@ -89,7 +131,13 @@ let session = try ETTerminalSession(
 )
 ```
 
-Connection state (connected, reconnecting, failed) is observable via `session.stateChanges`.
+The full lifecycle (`bootstrapping`, `connecting`, `connected`, `disconnected`,
+`reconnecting`, and terminal states) is observable via `session.stateChanges`. If your network
+monitor reports a meaningful path change, nudge recovery without waiting for the normal retry:
+
+```swift
+await session.notifyNetworkPathChanged()
+```
 
 ## Testing
 

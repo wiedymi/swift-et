@@ -1,10 +1,15 @@
 import Foundation
 
+/// Pure Swift XSalsa20-Poly1305 compatible with libsodium secretbox easy APIs.
 public enum XSalsa20Poly1305 {
+    /// Required secret-key size.
     public static let keyByteCount = 32
+    /// Required nonce size.
     public static let nonceByteCount = 24
+    /// Prepended authenticator size.
     public static let tagByteCount = Poly1305.tagByteCount
 
+    /// Authenticates and encrypts a message.
     public static func seal<Message: ContiguousBytes, Nonce: ContiguousBytes, Key: ContiguousBytes>(
         _ message: Message,
         nonce: Nonce,
@@ -64,6 +69,7 @@ public enum XSalsa20Poly1305 {
         }
     }
 
+    /// Authenticates and decrypts a secretbox ciphertext.
     public static func open<Ciphertext: ContiguousBytes, Nonce: ContiguousBytes, Key: ContiguousBytes>(
         _ sealed: Ciphertext,
         nonce: Nonce,

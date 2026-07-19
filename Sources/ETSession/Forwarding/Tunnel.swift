@@ -1,38 +1,59 @@
-import ETProtocol
+import ETCore
+import ETCrypto
 import Foundation
 
+/// A TCP or Unix-domain forwarding endpoint.
 public enum ETTunnelEndpoint: Hashable, Sendable {
+    /// A TCP endpoint; a nil host uses the protocol-side default.
     case tcp(host: String?, port: UInt16)
+    /// A named Unix-domain socket path.
     case unix(path: String)
 }
 
+/// The local source binding for a forward tunnel.
 public enum ETTunnelSource: Equatable, Sendable {
+    /// A concrete TCP or Unix-domain endpoint.
     case endpoint(ETTunnelEndpoint)
+    /// A Unix socket path read from an environment variable.
     case environmentVariable(String)
 }
 
+/// A parsed forward or reverse tunnel mapping.
 public struct ETTunnel: Equatable, Sendable {
+    /// Source binding.
     public let source: ETTunnelSource
+    /// Destination endpoint.
     public let destination: ETTunnelEndpoint
 
+    /// Creates a tunnel mapping.
     public init(source: ETTunnelSource, destination: ETTunnelEndpoint) {
         self.source = source
         self.destination = destination
     }
 
+    /// Parses the C++ client's comma-separated tunnel grammar, expanding port ranges.
     public static func parse(_ specification: String) throws -> [ETTunnel] {
         try ETTunnelParser.parse(specification)
     }
 }
 
+/// Typed reasons a tunnel specification can be rejected.
 public enum ETTunnelParseReason: Equatable, Sendable {
+    /// The specification was empty.
     case emptySpecification
+    /// Source or destination syntax was absent.
     case missingSourceOrDestination
+    /// A source or destination port was invalid.
     case invalidPort(String)
+    /// A port range was malformed or descending.
     case invalidRange(String)
+    /// A range appeared without a matching range endpoint.
     case rangePairRequired
+    /// Source and destination ranges had different lengths.
     case rangeLengthMismatch
+    /// SSH-style host syntax did not contain all four fields.
     case sshStyleRequiresFourParts
+    /// An IPv6 address was not bracketed.
     case unbracketedIPv6
 }
 

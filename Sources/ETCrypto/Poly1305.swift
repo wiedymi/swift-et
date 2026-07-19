@@ -1,9 +1,13 @@
 import Foundation
 
+/// Pure Swift Poly1305 message authentication.
 public enum Poly1305 {
+    /// Required authentication-key size.
     public static let keyByteCount = 32
+    /// Produced authenticator size.
     public static let tagByteCount = 16
 
+    /// Computes a Poly1305 authenticator.
     public static func authenticate<Message: ContiguousBytes, Key: ContiguousBytes>(
         _ message: Message,
         key: Key

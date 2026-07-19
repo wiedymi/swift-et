@@ -4,7 +4,7 @@ set -eu
 
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 proto_root="$repository_root/refs/EternalTerminal/proto"
-output_root="$repository_root/Sources/ETProtocol/Proto"
+output_root="$repository_root/Sources/ETCore/Proto"
 
 if ! command -v protoc >/dev/null 2>&1; then
   echo "error: protoc is required" >&2

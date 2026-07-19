@@ -1,12 +1,15 @@
-@testable import ETClient
-import ETProtocol
+@testable import ETSession
+import ETBootstrap
+import ETCore
+import ETCrypto
+import ETTransport
 import Foundation
 import SwiftProtobuf
 import XCTest
 
 @MainActor
 final class ETClientTests: XCTestCase {
-    private let key = Data((0..<32).map(UInt8.init))
+    private let key = Data("0123456789abcdefghijklmnopqrstuv".utf8)
 
     func testHandshakeTerminalInputResizeAndOutput() async throws {
         let server = FakeETServer()
@@ -35,6 +38,79 @@ final class ETClientTests: XCTestCase {
         XCTAssertEqual(snapshot.initialPayloads.count, 1)
         XCTAssertEqual(snapshot.terminalInput, [Data("client input".utf8)])
         XCTAssertEqual(snapshot.terminalSizes, [TerminalSize(rows: 42, columns: 132)])
+        await session.close()
+    }
+
+    func testResizeEncodesOptionalPixelDimensions() async throws {
+        let server = FakeETServer()
+        let session = try makeSession(server: server)
+        try await session.connect()
+
+        try await session.resize(
+            rows: 50,
+            cols: 160,
+            pixelWidth: 1_920,
+            pixelHeight: 1_080
+        )
+
+        let sizes = await server.snapshot().terminalSizes
+        XCTAssertEqual(
+            sizes.last,
+            TerminalSize(
+                rows: 50,
+                columns: 160,
+                pixelWidth: 1_920,
+                pixelHeight: 1_080
+            )
+        )
+        do {
+            try await session.resize(rows: 50, cols: 160, pixelWidth: -1)
+            XCTFail("Expected negative pixel width to fail")
+        } catch {
+            XCTAssertEqual(
+                error as? ETClientError,
+                .invalidTerminalPixels(width: -1, height: nil)
+            )
+        }
+        await session.close()
+    }
+
+    func testBootstrapStatePrecedesConnecting() async throws {
+        let server = FakeETServer()
+        let gate = TestPauseGate()
+        let executor = GatedBootstrapExecutor(gate: gate)
+        let session = ETTerminalSession(
+            endpoint: TransportEndpoint(host: "in-memory", port: 2022),
+            bootstrapExecutor: executor,
+            transportFactory: InMemoryTransportFactory(server: server),
+            configuration: ETConnectionConfiguration(
+                reconnectDelay: .milliseconds(10),
+                initializationTimeout: .seconds(1),
+                keepAliveInterval: .seconds(10)
+            )
+        )
+        let states = StateCollector()
+        let stateTask = Task {
+            for await state in session.stateChanges {
+                await states.append(state)
+            }
+        }
+        defer { stateTask.cancel() }
+
+        let connectTask = Task { try await session.connect() }
+        await gate.waitUntilPaused()
+        let statesDuringBootstrap = await states.values()
+        XCTAssertEqual(statesDuringBootstrap.prefix(2), [.idle, .bootstrapping])
+        await gate.release()
+        try await connectTask.value
+        try await eventually {
+            await states.values().contains(.connected)
+        }
+        let connectedStates = await states.values()
+        XCTAssertEqual(
+            Array(connectedStates.prefix(4)),
+            [.idle, .bootstrapping, .connecting, .connected]
+        )
         await session.close()
     }
 
@@ -112,6 +188,71 @@ final class ETClientTests: XCTestCase {
             collectedOutput,
             (0..<3).map { Data("server-\($0)".utf8) }
         )
+        await session.close()
+    }
+
+    func testDisconnectStateSequenceAndForcedReconnectPreserveCatchupData() async throws {
+        let server = FakeETServer()
+        let session = try makeSession(
+            server: server,
+            reconnectDelay: .milliseconds(5),
+            keepAliveInterval: .seconds(10)
+        )
+        let states = StateCollector()
+        let stateTask = Task {
+            for await state in session.stateChanges {
+                await states.append(state)
+            }
+        }
+        defer { stateTask.cancel() }
+
+        try await session.connect()
+        await session.notifyNetworkPathChanged()
+        let duringRecovery = Data("nudge-catchup".utf8)
+        try await session.send(duringRecovery)
+
+        try await eventually {
+            let snapshot = await server.snapshot()
+            return snapshot.connectionCount >= 2
+                && snapshot.terminalInput.filter { $0 == duringRecovery }.count == 1
+        }
+        try await eventually {
+            let values = await states.values()
+            return values.containsConsecutiveSubsequence([
+                .connected,
+                .disconnected,
+                .reconnecting,
+                .connected,
+            ])
+        }
+        await session.close()
+    }
+
+    func testNetworkPathNudgeCancelsReconnectBackoff() async throws {
+        let server = FakeETServer()
+        let factory = ControlledTransportFactory(
+            server: server,
+            waitOnConnectionNumber: 2
+        )
+        let session = try makeSession(
+            server: server,
+            transportFactory: factory,
+            reconnectDelay: .seconds(5),
+            connectTimeout: .milliseconds(20),
+            keepAliveInterval: .seconds(10)
+        )
+        try await session.connect()
+        await server.disconnectClient()
+        try await eventually {
+            await factory.makeCount() == 2
+        }
+        try await Task.sleep(for: .milliseconds(40))
+
+        await session.notifyNetworkPathChanged()
+
+        try await eventually(timeout: .seconds(1)) {
+            await factory.makeCount() >= 3
+        }
         await session.close()
     }
 
@@ -588,6 +729,20 @@ final class ETClientTests: XCTestCase {
 private struct TerminalSize: Equatable, Sendable {
     let rows: Int32
     let columns: Int32
+    let pixelWidth: Int32?
+    let pixelHeight: Int32?
+
+    init(
+        rows: Int32,
+        columns: Int32,
+        pixelWidth: Int32? = nil,
+        pixelHeight: Int32? = nil
+    ) {
+        self.rows = rows
+        self.columns = columns
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+    }
 }
 
 private struct ServerSnapshot: Sendable {
@@ -616,6 +771,18 @@ private actor OutputCollector {
     }
 }
 
+private actor StateCollector {
+    private var states: [ETConnectionState] = []
+
+    func append(_ state: ETConnectionState) {
+        states.append(state)
+    }
+
+    func values() -> [ETConnectionState] {
+        states
+    }
+}
+
 private enum ServerAcceptance: Sendable {
     case normal
     case reject(Et_ConnectStatus, String)
@@ -641,7 +808,7 @@ private actor FakeETServer {
     private let echoKeepAlives: Bool
     private let reconnectResponseGate: TestPauseGate?
     private let responseChunkSizes = [1, 2, 5, 3, 8]
-    private let key = Data((0..<32).map(UInt8.init))
+    private let key = Data("0123456789abcdefghijklmnopqrstuv".utf8)
 
     private var connectionCount = 0
     private var connectionID = 0
@@ -908,7 +1075,12 @@ private actor FakeETServer {
         case UInt8(Et_TerminalPacketType.terminalInfo.rawValue):
             let terminalInfo = try Et_TerminalInfo(serializedBytes: packet.payload)
             terminalSizes.append(
-                TerminalSize(rows: terminalInfo.row, columns: terminalInfo.column)
+                TerminalSize(
+                    rows: terminalInfo.row,
+                    columns: terminalInfo.column,
+                    pixelWidth: terminalInfo.hasWidth ? terminalInfo.width : nil,
+                    pixelHeight: terminalInfo.hasHeight ? terminalInfo.height : nil
+                )
             )
 
         case UInt8(Et_TerminalPacketType.keepAlive.rawValue):
@@ -1087,6 +1259,20 @@ private actor TestPauseGate {
         let waiter = pauseWaiter
         pauseWaiter = nil
         waiter?.resume()
+    }
+}
+
+private actor GatedBootstrapExecutor: ETBootstrapExecutor {
+    private let gate: TestPauseGate
+
+    init(gate: TestPauseGate) {
+        self.gate = gate
+    }
+
+    func run(command: String) async -> String {
+        _ = command
+        await gate.pause()
+        return "IDPASSKEY:abcdefghijklmnop/0123456789abcdefghijklmnopqrstuv"
     }
 }
 
@@ -1462,5 +1648,18 @@ private actor AsyncForwardingSocketQueue {
         for socket in sockets {
             await socket.close()
         }
+    }
+}
+
+private extension Array where Element: Equatable {
+    func containsConsecutiveSubsequence(_ subsequence: [Element]) -> Bool {
+        guard !subsequence.isEmpty else { return true }
+        guard count >= subsequence.count else { return false }
+        for start in 0...(count - subsequence.count) {
+            if Array(self[start..<(start + subsequence.count)]) == subsequence {
+                return true
+            }
+        }
+        return false
     }
 }

@@ -1,13 +1,21 @@
+import ETCrypto
 import Foundation
 
+/// Result state for a reliable writer operation.
 public enum BackedWriterWriteState: Equatable, Sendable {
+    /// The disconnected buffer had no remaining capacity.
     case skipped
+    /// Ciphertext was produced for immediate transport.
     case success
+    /// Ciphertext was retained for recovery while disconnected.
     case bufferedOnly
 }
 
+/// The result of encrypting and sequencing one packet.
 public struct BackedWriterWrite: Sendable {
+    /// How the writer handled the packet.
     public let state: BackedWriterWriteState
+    /// Original framed ciphertext when it should be written immediately.
     public let framedBytes: Data?
 
     init(state: BackedWriterWriteState, framedBytes: Data? = nil) {
@@ -16,8 +24,11 @@ public struct BackedWriterWrite: Sendable {
     }
 }
 
+/// Encrypts packets and retains original ciphertext for reconnect catchup.
 public actor BackedWriter {
+    /// Maximum retained ciphertext window.
     public static let maximumBackupBytes = 64 * 1024 * 1024
+    /// Maximum data accepted while disconnected.
     public static let disconnectBufferBytes = 64 * 1024 * 1024
 
     private var crypto: SecretBoxState
@@ -27,6 +38,7 @@ public actor BackedWriter {
     private var disconnectedBytes = 0
     private var sequenceNumber: Int64 = 0
 
+    /// Creates a writer for one directional nonce stream.
     public init<Key: ContiguousBytes & Sendable>(
         key: Key,
         nonceMostSignificantByte: UInt8,
@@ -39,6 +51,7 @@ public actor BackedWriter {
         isConnected = connected
     }
 
+    /// Encrypts, sequences, and optionally frames one packet.
     public func write(_ packet: Packet) throws -> BackedWriterWrite {
         guard !packet.encrypted else {
             throw ETProtocolError.packetAlreadyEncrypted
@@ -86,6 +99,7 @@ public actor BackedWriter {
         return BackedWriterWrite(state: .bufferedOnly)
     }
 
+    /// Reports whether a disconnected write of the given size can be accepted.
     public func hasBufferCapacity(forByteCount byteCount: Int) throws -> Bool {
         guard byteCount >= 0 else { throw ETProtocolError.invalidCapacity(byteCount) }
         guard !isConnected else { return true }
@@ -93,6 +107,7 @@ public actor BackedWriter {
         return !overflow && prospectiveBytes <= Self.disconnectBufferBytes
     }
 
+    /// Returns original serialized ciphertext after a peer's last valid sequence number.
     public func recover(after lastValidSequenceNumber: Int64) throws -> [Data] {
         guard !isConnected else { throw ETProtocolError.recoveryRequiresDisconnected }
         guard lastValidSequenceNumber >= 0, lastValidSequenceNumber <= sequenceNumber else {
@@ -109,21 +124,25 @@ public actor BackedWriter {
         return backupBuffer.suffix(requestedCount).map { $0.serialized() }
     }
 
+    /// Builds the protobuf catchup payload for a reconnect handshake.
     public func catchupBuffer(after lastValidSequenceNumber: Int64) throws -> Et_CatchupBuffer {
         var catchup = Et_CatchupBuffer()
         catchup.buffer = try recover(after: lastValidSequenceNumber)
         return catchup
     }
 
+    /// Marks the writer disconnected while retaining its ciphertext window.
     public func invalidate() {
         isConnected = false
     }
 
+    /// Marks a recovered writer connected and resets disconnected-byte accounting.
     public func revive() {
         isConnected = true
         disconnectedBytes = 0
     }
 
+    /// Returns the full-width local sequence number.
     public func currentSequenceNumber() -> Int64 {
         sequenceNumber
     }

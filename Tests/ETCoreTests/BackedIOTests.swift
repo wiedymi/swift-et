@@ -1,4 +1,5 @@
-import ETProtocol
+import ETCore
+import ETCrypto
 import Foundation
 import XCTest
 

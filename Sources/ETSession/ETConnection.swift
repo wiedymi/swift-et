@@ -1,29 +1,58 @@
-import ETProtocol
+import ETCore
+import ETCrypto
+import ETTransport
 import Foundation
 import SwiftProtobuf
 
+/// Public failures raised by session setup, transport, and forwarding operations.
 public enum ETClientError: Error, Equatable, Sendable {
+    /// A secretbox passkey was not 32 bytes.
     case invalidPasskeyLength(actual: Int)
+    /// The server rejected the passkey.
     case invalidKey(String)
+    /// The server rejected protocol version 6.
     case mismatchedProtocol(String)
+    /// The server returned an invalid status for the current lifecycle phase.
     case unexpectedConnectStatus(Et_ConnectStatus, String)
+    /// The encrypted initial exchange failed.
     case initializationFailed(String)
+    /// A length-prefixed protobuf frame was invalid.
     case malformedFrame(String)
+    /// The transport failed.
     case transportFailure(String)
+    /// The disconnected reliable buffer is full.
     case disconnectedBufferFull
+    /// A connect operation is already running.
     case connectionInProgress
+    /// The session has closed permanently.
     case connectionClosed
+    /// Terminal rows or columns were invalid or exceeded Int32.
     case invalidTerminalSize(rows: Int, columns: Int)
+    /// Pixel dimensions were negative or exceeded Int32.
+    case invalidTerminalPixels(width: Int?, height: Int?)
+    /// A tunnel string was invalid.
     case invalidTunnelSpecification(String, ETTunnelParseReason)
+    /// A forwarding socket or listener failed.
     case forwardingFailure(String)
 }
 
+/// Observable lifecycle state for an Eternal Terminal session.
 public enum ETConnectionState: Equatable, Sendable {
+    /// No connection work has started.
     case idle
+    /// The consumer-provided bootstrap executor is running.
+    case bootstrapping
+    /// A TCP connection or initial handshake is in progress.
     case connecting
+    /// The encrypted session is active.
     case connected
+    /// The active transport was lost and has been torn down.
+    case disconnected
+    /// Recovery attempts are in progress or waiting for retry.
     case reconnecting
+    /// A nonrecoverable error ended the session.
     case failed(ETClientError)
+    /// The consumer closed the session.
     case closed
 }
 
@@ -44,7 +73,7 @@ actor ETConnection {
     private let stateContinuation: AsyncStream<ETConnectionState>.Continuation
     private let endpoint: TransportEndpoint
     private let clientID: String
-    private let passkey: Data
+    private let passkey: SecretKey
     private let transportFactory: any TransportFactory
     private let configuration: ETConnectionConfiguration
 
@@ -57,6 +86,7 @@ actor ETConnection {
     private var readTask: Task<Void, Never>?
     private var stateTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectBackoffTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var writeDrainTask: Task<Void, Never>?
     private var waitingOnKeepAlive = false
@@ -90,7 +120,7 @@ actor ETConnection {
 
         self.endpoint = endpoint
         self.clientID = clientID
-        self.passkey = passkey
+        self.passkey = SecretKey(passkey)
         self.transportFactory = transportFactory
         self.configuration = configuration
     }
@@ -167,11 +197,13 @@ actor ETConnection {
         readTask?.cancel()
         stateTask?.cancel()
         reconnectTask?.cancel()
+        reconnectBackoffTask?.cancel()
         heartbeatTask?.cancel()
         writeDrainTask?.cancel()
         readTask = nil
         stateTask = nil
         reconnectTask = nil
+        reconnectBackoffTask = nil
         heartbeatTask = nil
         writeDrainTask = nil
 
@@ -192,6 +224,17 @@ actor ETConnection {
         packetContinuation.finish()
         updateState(.closed)
         stateContinuation.finish()
+    }
+
+    func notifyNetworkPathChanged() async {
+        switch state {
+        case .connected:
+            await connectionDidFail(generation: generation)
+        case .reconnecting:
+            reconnectBackoffTask?.cancel()
+        case .idle, .bootstrapping, .connecting, .disconnected, .failed, .closed:
+            return
+        }
     }
 
     private func exchangeConnectRequest(
@@ -451,6 +494,7 @@ actor ETConnection {
         let failedTransport = transport
         transport = nil
         await failedTransport?.close()
+        updateState(.disconnected)
         updateState(.reconnecting)
         startReconnectLoop()
     }
@@ -475,11 +519,8 @@ actor ETConnection {
                 } catch {
                     // Retry transport and recoverable handshake failures.
                 }
-                do {
-                    try await Task.sleep(for: delay)
-                } catch {
-                    return
-                }
+                await self.waitBeforeReconnect(delay)
+                guard !Task.isCancelled else { return }
             }
         }
     }
@@ -566,6 +607,19 @@ actor ETConnection {
         }
     }
 
+    private func waitBeforeReconnect(_ delay: Duration) async {
+        let task = Task<Void, Never> {
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+        }
+        reconnectBackoffTask = task
+        await task.value
+        reconnectBackoffTask = nil
+    }
+
     private func failPermanently(_ error: ETClientError) async {
         guard !isClosed else { return }
         isClosed = true
@@ -573,11 +627,13 @@ actor ETConnection {
         readTask?.cancel()
         stateTask?.cancel()
         reconnectTask?.cancel()
+        reconnectBackoffTask?.cancel()
         heartbeatTask?.cancel()
         writeDrainTask?.cancel()
         readTask = nil
         stateTask = nil
         reconnectTask = nil
+        reconnectBackoffTask = nil
         heartbeatTask = nil
         writeDrainTask = nil
         isRecovering = false

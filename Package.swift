@@ -9,8 +9,12 @@ let package = Package(
         .iOS(.v16),
     ],
     products: [
-        .library(name: "ETProtocol", targets: ["ETProtocol"]),
-        .library(name: "ETClient", targets: ["ETClient"]),
+        .library(name: "ETCrypto", targets: ["ETCrypto"]),
+        .library(name: "ETCore", targets: ["ETCore"]),
+        .library(name: "ETTransport", targets: ["ETTransport"]),
+        .library(name: "ETBootstrap", targets: ["ETBootstrap"]),
+        .library(name: "ETSession", targets: ["ETSession"]),
+        .executable(name: "ETDemo", targets: ["ETDemo"]),
     ],
     dependencies: [
         .package(
@@ -24,8 +28,15 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "ETProtocol",
+            name: "ETCrypto",
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .target(
+            name: "ETCore",
             dependencies: [
+                "ETCrypto",
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
             swiftSettings: [
@@ -33,9 +44,24 @@ let package = Package(
             ]
         ),
         .target(
-            name: "ETClient",
+            name: "ETTransport",
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .target(
+            name: "ETBootstrap",
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .target(
+            name: "ETSession",
             dependencies: [
-                "ETProtocol",
+                "ETCore",
+                "ETCrypto",
+                "ETTransport",
+                "ETBootstrap",
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
             swiftSettings: [
@@ -45,7 +71,8 @@ let package = Package(
         .executableTarget(
             name: "Benchmarks",
             dependencies: [
-                "ETProtocol",
+                "ETCore",
+                "ETCrypto",
                 .product(name: "Sodium", package: "swift-sodium"),
             ],
             path: "Benchmarks",
@@ -53,10 +80,21 @@ let package = Package(
                 .enableUpcomingFeature("StrictConcurrency"),
             ]
         ),
-        .testTarget(
-            name: "ETProtocolTests",
+        .executableTarget(
+            name: "ETDemo",
             dependencies: [
-                "ETProtocol",
+                "ETBootstrap",
+                "ETSession",
+            ],
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .testTarget(
+            name: "ETCoreTests",
+            dependencies: [
+                "ETCore",
+                "ETCrypto",
                 .product(name: "Sodium", package: "swift-sodium"),
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
@@ -65,11 +103,23 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "ETClientTests",
+            name: "ETSessionTests",
             dependencies: [
-                "ETClient",
-                "ETProtocol",
+                "ETSession",
+                "ETCore",
+                "ETCrypto",
+                "ETTransport",
+                "ETBootstrap",
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .testTarget(
+            name: "ETBootstrapTests",
+            dependencies: [
+                "ETBootstrap",
             ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),
@@ -78,7 +128,8 @@ let package = Package(
         .testTarget(
             name: "ETIntegrationTests",
             dependencies: [
-                "ETClient",
+                "ETSession",
+                "ETBootstrap",
             ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency"),

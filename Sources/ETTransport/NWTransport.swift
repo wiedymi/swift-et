@@ -1,8 +1,8 @@
 import Foundation
 import Network
 
-actor NWTransport: Transport {
-    nonisolated let stateChanges: AsyncStream<TransportState>
+package actor NWTransport: Transport {
+    package nonisolated let stateChanges: AsyncStream<TransportState>
 
     private let stateContinuation: AsyncStream<TransportState>.Continuation
     private let queue = DispatchQueue(label: "ETClient.NWTransport")
@@ -19,7 +19,7 @@ actor NWTransport: Transport {
         stateContinuation.yield(.idle)
     }
 
-    func connect(to endpoint: TransportEndpoint) async throws {
+    package func connect(to endpoint: TransportEndpoint) async throws {
         guard connection == nil else { throw TransportError.alreadyConnected }
         guard let port = NWEndpoint.Port(rawValue: endpoint.port) else {
             throw TransportError.failed("Invalid TCP port: \(endpoint.port)")
@@ -61,7 +61,7 @@ actor NWTransport: Transport {
         }
     }
 
-    func read() async throws -> Data {
+    package func read() async throws -> Data {
         guard let connection else { throw TransportError.notConnected }
 
         return try await withCheckedThrowingContinuation {
@@ -85,7 +85,7 @@ actor NWTransport: Transport {
         }
     }
 
-    func write(_ data: Data) async throws {
+    package func write(_ data: Data) async throws {
         guard let connection else { throw TransportError.notConnected }
         guard !data.isEmpty else { return }
 
@@ -106,7 +106,7 @@ actor NWTransport: Transport {
         }
     }
 
-    func close() {
+    package func close() {
         let currentConnection = connection
         connection = nil
         currentConnection?.stateUpdateHandler = nil

@@ -7,14 +7,25 @@
 // and any TCP proxy/listeners under a unique temporary directory. The suite is
 // skipped before creating those resources unless ET_INTEGRATION=1.
 
-@testable import ETClient
+@testable import ETSession
 import Darwin
+import ETBootstrap
 import Foundation
 import Network
 import XCTest
 
 @MainActor
 final class ETIntegrationTests: XCTestCase {
+    func testRealBootstrapThenTerminalEcho() async throws {
+        try requireIntegration()
+        try await withFixture { fixture in
+            let session = try await fixture.connectBootstrappedSession()
+            await fixture.clearOutput()
+            try await session.send(Data("echo bootstrap-et\n".utf8))
+            try await fixture.waitForOutput("bootstrap-et", minimumOccurrences: 2)
+        }
+    }
+
     func testHandshakeAndTerminalEcho() async throws {
         try requireIntegration()
         try await withFixture { fixture in
@@ -242,6 +253,29 @@ private final class IntegrationFixture {
         return newSession
     }
 
+    func connectBootstrappedSession() async throws -> ETTerminalSession {
+        guard session == nil else { throw IntegrationError.sessionAlreadyConnected }
+        let newSession = ETTerminalSession(
+            host: "127.0.0.1",
+            port: serverPort,
+            bootstrapExecutor: LocalShellBootstrapExecutor(),
+            bootstrapOptions: ETBootstrapOptions(
+                etterminalPath: Self.terminalExecutable.path,
+                serverFifo: fifoURL.path
+            ),
+            environmentVariables: ["TERM": "xterm-256color"]
+        )
+        session = newSession
+        outputTask = Task { [output, stream = newSession.output] in
+            for await bytes in stream {
+                guard !Task.isCancelled else { return }
+                await output.append(bytes)
+            }
+        }
+        try await newSession.connect()
+        return newSession
+    }
+
     func startDropProxy() async throws -> DropTCPProxy {
         let proxy = try DropTCPProxy(upstreamPort: serverPort)
         try await proxy.start()
@@ -293,11 +327,11 @@ private final class IntegrationFixture {
         await session?.close()
         session = nil
 
-        let discoveredTerminalPID = terminalDaemonPID ?? processIDs(
+        let discoveredTerminalPIDs = processIDs(
             matchingCommandFragments: [Self.terminalExecutable.path, fifoURL.path]
-        ).first
-        if let discoveredTerminalPID {
-            await stopProcess(identifier: discoveredTerminalPID, includeDescendants: true)
+        )
+        for pid in discoveredTerminalPIDs {
+            await stopProcess(identifier: pid, includeDescendants: true)
         }
         terminalDaemonPID = nil
         await stopProcess(terminalProcess, includeDescendants: false)
@@ -432,6 +466,26 @@ private final class IntegrationFixture {
 
     private func readLog(_ url: URL) -> String {
         guard let data = try? Data(contentsOf: url) else { return "" }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+private actor LocalShellBootstrapExecutor: ETBootstrapExecutor {
+    func run(command: String) throws -> String {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", command]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["SHELL"] = "/bin/sh"
+        environment["TERM"] = "xterm-256color"
+        process.environment = environment
+        try process.run()
+        let data = try output.fileHandleForReading.readToEnd() ?? Data()
+        process.waitUntilExit()
         return String(decoding: data, as: UTF8.self)
     }
 }
