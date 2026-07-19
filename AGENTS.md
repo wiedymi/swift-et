@@ -56,7 +56,7 @@ Benchmarks/                crypto + framing throughput; swift-sodium as oracle/b
 refs/EternalTerminal/      submodule, reference only
 ```
 
-Generated protobuf Swift files are **checked in** (regenerate with `protoc --swift_out=... refs/EternalTerminal/proto/*.proto`; `brew install swift-protobuf` provides `protoc-gen-swift`). Consumers must not need protoc.
+Generated protobuf Swift files are **checked in** (regenerate with `scripts/gen-proto.sh`; `brew install swift-protobuf` provides `protoc-gen-swift`). Consumers must not need protoc.
 
 ## Protocol facts (verified against source; re-verify details in refs when implementing)
 

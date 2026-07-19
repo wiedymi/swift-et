@@ -77,6 +77,10 @@ final class ETIntegrationTests: XCTestCase {
             ProcessInfo.processInfo.environment["ET_INTEGRATION"] == "1",
             "Set ET_INTEGRATION=1 to run against /opt/homebrew/bin/etserver"
         )
+        try XCTSkipUnless(
+            IntegrationFixture.hasRequiredExecutables,
+            "etserver/etterminal not found; install with: brew install MisterTea/et/et"
+        )
     }
 
     private func withFixture(
@@ -102,6 +106,11 @@ final class ETIntegrationTests: XCTestCase {
 private final class IntegrationFixture {
     private static let serverExecutable = URL(fileURLWithPath: "/opt/homebrew/bin/etserver")
     private static let terminalExecutable = URL(fileURLWithPath: "/opt/homebrew/bin/etterminal")
+
+    static var hasRequiredExecutables: Bool {
+        FileManager.default.isExecutableFile(atPath: serverExecutable.path)
+            && FileManager.default.isExecutableFile(atPath: terminalExecutable.path)
+    }
 
     private let directory: URL
     private let configURL: URL

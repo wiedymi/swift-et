@@ -38,7 +38,7 @@ final class CryptoTests: XCTestCase {
 
     func testMatchesLibsodiumAcrossBoundarySizes() throws {
         let sodium = Sodium()
-        let lengths = [0, 1, 15, 16, 17, 63, 64, 65, 1_024, 65_536, 1_048_576]
+        let lengths = [0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 1_024, 65_536, 1_048_576]
         var generator = DeterministicBytes()
 
         for length in lengths {
@@ -80,6 +80,56 @@ final class CryptoTests: XCTestCase {
                 XCTAssertEqual($0 as? ETProtocolError, .authenticationFailed)
             }
         }
+    }
+
+    func testRejectsTamperedTagOnlyCiphertextAndTruncatedInput() throws {
+        let key = [UInt8](0..<32)
+        let nonce = [UInt8](0..<24)
+        let sealed = try XSalsa20Poly1305.seal([UInt8](), nonce: nonce, key: key)
+        XCTAssertEqual(sealed.count, XSalsa20Poly1305.tagByteCount)
+
+        for index in 0..<sealed.count {
+            var tampered = sealed
+            tampered[index] ^= 0x01
+            XCTAssertThrowsError(try XSalsa20Poly1305.open(tampered, nonce: nonce, key: key)) {
+                XCTAssertEqual($0 as? ETProtocolError, .authenticationFailed)
+            }
+        }
+
+        XCTAssertThrowsError(
+            try XSalsa20Poly1305.open(sealed.prefix(15), nonce: nonce, key: key)
+        ) {
+            XCTAssertEqual(
+                $0 as? ETProtocolError,
+                .ciphertextTooShort(minimum: XSalsa20Poly1305.tagByteCount, actual: 15)
+            )
+        }
+    }
+
+    func testNonceCarryPropagatesAcrossBytesAgainstLibsodium() async throws {
+        let sodium = Sodium()
+        let key = Data(repeating: 3, count: 32)
+        let box = try SecretBox(key: key, nonceMostSignificantByte: 1)
+        let message = [UInt8]("carry".utf8)
+
+        for _ in 0..<255 {
+            _ = try await box.seal(Data(message))
+        }
+
+        // The 256th pre-increment rolls nonce byte 0 over to 0 and carries into byte 1.
+        var expectedNonce = [UInt8](repeating: 0, count: 24)
+        expectedNonce[0] = 0
+        expectedNonce[1] = 1
+        expectedNonce[23] = 1
+        let expected = try XCTUnwrap(
+            sodium.secretBox.seal(
+                message: message,
+                secretKey: Array(key),
+                nonce: expectedNonce
+            )
+        )
+        let sealed = try await box.seal(Data(message))
+        XCTAssertEqual(Array(sealed), expected)
     }
 
     func testSecretBoxUsesPreincrementedLittleEndianNonceAndConsumesFailures() async throws {
