@@ -79,6 +79,22 @@ final class ETIntegrationTests: XCTestCase {
         }
     }
 
+    func testBackgroundCheckpointRestoresShellStateAfterClientRelaunch() async throws {
+        try requireIntegration()
+        try await withFixture { fixture in
+            let session = try await fixture.connectSession()
+            try await session.send(Data("et_background_state=survived\n".utf8))
+            try await session.send(Data("echo background-checkpoint-ready\n".utf8))
+            try await fixture.waitForOutput("background-checkpoint-ready", minimumOccurrences: 2)
+            let checkpoint = try await session.prepareForApplicationBackground()
+
+            let restored = try await fixture.restoreSession(from: checkpoint)
+            await fixture.clearOutput()
+            try await restored.send(Data("echo \"$et_background_state\"\n".utf8))
+            try await fixture.waitForOutput("survived")
+        }
+    }
+
     func testForwardTunnelAgainstLocalEchoServer() async throws {
         try requireIntegration()
         try await withFixture { fixture in

@@ -117,19 +117,20 @@ package actor NWTransport: Transport {
     }
 
     private func handle(_ event: NWStateEvent) {
-        switch event {
-        case .ready:
+        switch event.connectResolution {
+        case .connected:
             updateState(.ready)
             resumeConnect()
-        case .waiting(let message):
+        case .pending:
             updateState(.waiting)
-            guard connectContinuation != nil else { return }
-            connection?.cancel()
-            resumeConnect(throwing: TransportError.failed(message))
+            // Network.framework uses `waiting` for recoverable conditions such as
+            // local-network routing and mDNS resolution during app activation. Keep
+            // the same NWConnection alive; ETConnection's connect timeout remains
+            // the single bound on how long the attempt may wait.
         case .failed(let message):
             updateState(.failed(message))
             resumeConnect(throwing: TransportError.failed(message))
-        case .cancelled:
+        case .closed:
             updateState(.closed)
             resumeConnect(throwing: TransportError.connectionClosed)
         }
@@ -152,9 +153,29 @@ package actor NWTransport: Transport {
     }
 }
 
-private enum NWStateEvent: Sendable {
+package enum NWStateEvent: Sendable {
     case ready
     case waiting(String)
     case failed(String)
     case cancelled
+
+    package var connectResolution: NWTransportConnectResolution {
+        switch self {
+        case .ready:
+            .connected
+        case .waiting:
+            .pending
+        case .failed(let message):
+            .failed(message)
+        case .cancelled:
+            .closed
+        }
+    }
+}
+
+package enum NWTransportConnectResolution: Equatable, Sendable {
+    case pending
+    case connected
+    case failed(String)
+    case closed
 }
