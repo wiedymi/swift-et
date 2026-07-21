@@ -157,6 +157,38 @@ final class ETClientTests: XCTestCase {
         await restored.close()
     }
 
+    func testCheckpointCanBeRenewedAcrossRepeatedClientRelaunches() async throws {
+        let server = FakeETServer()
+        var session = try makeSession(server: server)
+        try await session.connect()
+
+        for relaunch in 1...3 {
+            let checkpoint = try await session.prepareForApplicationBackground()
+            await session.close()
+
+            session = try ETTerminalSession(
+                endpoint: TransportEndpoint(host: "in-memory", port: 2022),
+                clientID: "test-client",
+                passkey: key,
+                checkpoint: checkpoint,
+                transportFactory: InMemoryTransportFactory(server: server),
+                configuration: ETConnectionConfiguration(
+                    reconnectDelay: .milliseconds(10),
+                    initializationTimeout: .seconds(1),
+                    keepAliveInterval: .seconds(10)
+                )
+            )
+            try await session.connect()
+            let payload = Data("after-relaunch-\(relaunch)".utf8)
+            try await session.send(payload)
+            try await eventually {
+                await server.snapshot().terminalInput.last == payload
+            }
+        }
+
+        await session.close()
+    }
+
     func testStaleCheckpointIsUnrecoverableInsteadOfTransportFailure() async throws {
         let server = FakeETServer()
         let original = try makeSession(server: server)

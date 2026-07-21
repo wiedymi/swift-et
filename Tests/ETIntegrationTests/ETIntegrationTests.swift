@@ -118,6 +118,22 @@ final class ETIntegrationTests: XCTestCase {
         }
     }
 
+    func testBackgroundCheckpointSupportsRepeatedClientRelaunches() async throws {
+        try requireIntegration()
+        try await withFixture { fixture in
+            var session = try await fixture.connectSession()
+            try await session.send(Data("et_repeated_state=survived\n".utf8))
+
+            for relaunch in 1...3 {
+                let checkpoint = try await session.prepareForApplicationBackground()
+                session = try await fixture.restoreSession(from: checkpoint)
+                await fixture.clearOutput()
+                try await session.send(Data("echo \"$et_repeated_state-\(relaunch)\"\n".utf8))
+                try await fixture.waitForOutput("survived-\(relaunch)")
+            }
+        }
+    }
+
     func testForwardTunnelAgainstLocalEchoServer() async throws {
         try requireIntegration()
         try await withFixture { fixture in
