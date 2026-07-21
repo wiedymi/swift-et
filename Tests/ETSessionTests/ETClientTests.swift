@@ -339,6 +339,40 @@ final class ETClientTests: XCTestCase {
         await session.close()
     }
 
+    func testUnrecoverableCatchupFailsPermanentlyInsteadOfRetryingForever() async throws {
+        let server = FakeETServer(negativeReconnectSequence: true)
+        let session = try makeSession(
+            server: server,
+            reconnectDelay: .milliseconds(5),
+            keepAliveInterval: .seconds(10)
+        )
+        let stateTask = Task {
+            var states: [ETConnectionState] = []
+            for await state in session.stateChanges {
+                states.append(state)
+            }
+            return states
+        }
+
+        try await session.connect()
+        await server.disconnectClient()
+
+        let states = await stateTask.value
+        guard case .failed(.sessionUnrecoverable) = states.last else {
+            XCTFail("Expected .failed(.sessionUnrecoverable), got \(String(describing: states.last))")
+            return
+        }
+        XCTAssertTrue(states.contains(.reconnecting))
+
+        do {
+            try await session.send(Data("after unrecoverable".utf8))
+            XCTFail("Expected send after permanent failure to fail")
+        } catch {
+            XCTAssertEqual(error as? ETClientError, .connectionClosed)
+        }
+        await session.close()
+    }
+
     func testPermanentReconnectFailureFullyTearsDownConnection() async throws {
         let reconnectGate = TestPauseGate()
         let server = FakeETServer(
@@ -805,6 +839,7 @@ private protocol InMemoryClientSink: Sendable {
 
 private actor FakeETServer {
     private let acceptance: ServerAcceptance
+    private let negativeReconnectSequence: Bool
     private let echoKeepAlives: Bool
     private let reconnectResponseGate: TestPauseGate?
     private let responseChunkSizes = [1, 2, 5, 3, 8]
@@ -833,9 +868,11 @@ private actor FakeETServer {
     init(
         acceptance: ServerAcceptance = .normal,
         echoKeepAlives: Bool = true,
-        reconnectResponseGate: TestPauseGate? = nil
+        reconnectResponseGate: TestPauseGate? = nil,
+        negativeReconnectSequence: Bool = false
     ) {
         self.acceptance = acceptance
+        self.negativeReconnectSequence = negativeReconnectSequence
         self.echoKeepAlives = echoKeepAlives
         self.reconnectResponseGate = reconnectResponseGate
     }
@@ -1027,6 +1064,13 @@ private actor FakeETServer {
             guard let clientSequence = try takeProto(Et_SequenceHeader.self) else { return }
             reconnectClientSequences.append(clientSequence.sequenceNumber)
             guard let reader else { throw TransportError.connectionClosed }
+            if negativeReconnectSequence {
+                var invalidSequence = Et_SequenceHeader()
+                invalidSequence.sequenceNumber = -1
+                phase = .clientCatchup(clientSequence: Int64(clientSequence.sequenceNumber))
+                await deliverChunked(try frameProto(invalidSequence))
+                return
+            }
             let serverSequence = try await reader.sequenceHeader()
             phase = .clientCatchup(clientSequence: Int64(clientSequence.sequenceNumber))
             await deliverChunked(try frameProto(serverSequence))

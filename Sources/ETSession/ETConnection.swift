@@ -34,6 +34,10 @@ public enum ETClientError: Error, Equatable, Sendable {
     case invalidTunnelSpecification(String, ETTunnelParseReason)
     /// A forwarding socket or listener failed.
     case forwardingFailure(String)
+    /// Recovery can never succeed for this session: the peer requested catchup
+    /// history that is no longer retained, or the wire sequence ceiling was hit.
+    /// The session fails permanently instead of retrying; start a new session.
+    case sessionUnrecoverable(String)
 }
 
 /// Observable lifecycle state for an Eternal Terminal session.
@@ -516,6 +520,10 @@ actor ETConnection {
                         await self.failPermanently(error)
                         return
                     }
+                    if case .sessionUnrecoverable = error {
+                        await self.failPermanently(error)
+                        return
+                    }
                 } catch {
                     // Retry transport and recoverable handshake failures.
                 }
@@ -580,10 +588,18 @@ actor ETConnection {
             pendingTransport = nil
             activate(newTransport)
         } catch {
-            let clientError = mapError(error)
+            let clientError: ETClientError
+            switch error as? ETProtocolError {
+            case .recoveryUnavailable, .sequenceNumberOutOfRange:
+                // Retrying cannot help: the catchup gap only grows and sequence
+                // numbers never shrink, so classify as permanently unrecoverable.
+                clientError = .sessionUnrecoverable(String(describing: error))
+            default:
+                clientError = mapError(error)
+            }
             let isPermanentFailure: Bool
             switch clientError {
-            case .invalidKey, .mismatchedProtocol:
+            case .invalidKey, .mismatchedProtocol, .sessionUnrecoverable:
                 isPermanentFailure = true
             default:
                 isPermanentFailure = false
