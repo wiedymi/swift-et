@@ -27,6 +27,12 @@ original retained ciphertext, preserving nonce synchronization and packet order.
 ``ETTerminalSession/notifyNetworkPathChanged()`` after a platform path-change notification to
 force a connected transport through recovery or cancel the current reconnect backoff.
 
+For process relaunch recovery, persist the opaque ``ETSessionCheckpoint`` returned by
+``ETTerminalSession/prepareForApplicationBackground()`` while storing the passkey separately
+in a credential store. Restore both with the checkpoint initializer. If the original process
+continues running, call ``ETTerminalSession/resumeFromApplicationBackground()`` on foreground
+activation.
+
 ## Sequence ceiling
 
 The C++ wire protocol encodes recovery sequence numbers as signed 32-bit integers. Internal
@@ -41,6 +47,7 @@ the C++ implementation silently wraps.
 - ``ETTerminalSession``
 - ``ETConnectionState``
 - ``ETClientError``
+- ``ETSessionCheckpoint``
 
 ### Forwarding
 

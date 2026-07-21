@@ -63,6 +63,22 @@ final class ETIntegrationTests: XCTestCase {
         }
     }
 
+    func testCheckpointRestoresShellStateAfterClientRelaunch() async throws {
+        try requireIntegration()
+        try await withFixture { fixture in
+            let session = try await fixture.connectSession()
+            try await session.send(Data("et_cold_state=survived\n".utf8))
+            try await session.send(Data("echo checkpoint-ready\n".utf8))
+            try await fixture.waitForOutput("checkpoint-ready", minimumOccurrences: 2)
+            let checkpoint = try await session.checkpoint()
+
+            let restored = try await fixture.restoreSession(from: checkpoint)
+            await fixture.clearOutput()
+            try await restored.send(Data("echo \"$et_cold_state\"\n".utf8))
+            try await fixture.waitForOutput("survived")
+        }
+    }
+
     func testForwardTunnelAgainstLocalEchoServer() async throws {
         try requireIntegration()
         try await withFixture { fixture in
@@ -274,6 +290,30 @@ private final class IntegrationFixture {
         }
         try await newSession.connect()
         return newSession
+    }
+
+    func restoreSession(from checkpoint: ETSessionCheckpoint) async throws -> ETTerminalSession {
+        outputTask?.cancel()
+        outputTask = nil
+        await session?.close()
+
+        let restored = try ETTerminalSession(
+            host: "127.0.0.1",
+            port: serverPort,
+            clientID: clientID,
+            passkey: Data(passkey.utf8),
+            checkpoint: checkpoint,
+            environmentVariables: ["TERM": "xterm-256color"]
+        )
+        session = restored
+        outputTask = Task { [output, stream = restored.output] in
+            for await bytes in stream {
+                guard !Task.isCancelled else { return }
+                await output.append(bytes)
+            }
+        }
+        try await restored.connect()
+        return restored
     }
 
     func startDropProxy() async throws -> DropTCPProxy {

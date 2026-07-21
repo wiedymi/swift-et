@@ -14,7 +14,7 @@ This library implements the client side of the [Eternal Terminal](https://github
 
 - Wire-compatible with the C++ `etserver` (verified end-to-end against Eternal Terminal 7.0.0)
 - Pure Swift XSalsa20-Poly1305, byte-compatible with libsodium `crypto_secretbox` — no runtime crypto dependency
-- Seamless reconnection: sequence-numbered packet backup with ciphertext catchup replay, so sessions survive network drops with no data loss
+- Seamless reconnection and process relaunch recovery using sequence-numbered ciphertext checkpoints
 - Terminal session API: async/await, `AsyncStream` output, keystroke input, window resize
 - SSH bootstrap adapter with bring-your-own-SSH execution
 - Forward and reverse port tunnels, port ranges, Unix sockets, jumphost support
@@ -39,7 +39,7 @@ Add to `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/wiedymi/swift-et", from: "0.1.2")
+    .package(url: "https://github.com/wiedymi/swift-et", from: "0.1.3")
 ]
 ```
 
@@ -138,6 +138,24 @@ monitor reports a meaningful path change, nudge recovery without waiting for the
 ```swift
 await session.notifyNetworkPathChanged()
 ```
+
+To resume the same server-side session after an app relaunch, persist
+`ETSessionCheckpoint` separately from the passkey, then restore both:
+
+```swift
+let checkpoint = try await session.prepareForApplicationBackground()
+// Persist checkpoint; keep the passkey in Keychain or another credential store.
+
+let restored = try ETTerminalSession(
+    host: "example.com",
+    clientID: clientID,
+    passkey: passkey,
+    checkpoint: checkpoint
+)
+try await restored.connect()
+```
+
+If the process remains alive, call `resumeFromApplicationBackground()` after foregrounding.
 
 ## Testing
 

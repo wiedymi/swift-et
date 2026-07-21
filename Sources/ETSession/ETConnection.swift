@@ -26,6 +26,8 @@ public enum ETClientError: Error, Equatable, Sendable {
     case connectionInProgress
     /// The session has closed permanently.
     case connectionClosed
+    /// Application backgrounding temporarily paused client writes.
+    case applicationSuspended
     /// Terminal rows or columns were invalid or exceeded Int32.
     case invalidTerminalSize(rows: Int, columns: Int)
     /// Pixel dimensions were negative or exceeded Int32.
@@ -80,6 +82,7 @@ actor ETConnection {
     private let passkey: SecretKey
     private let transportFactory: any TransportFactory
     private let configuration: ETConnectionConfiguration
+    private let restoresPreviousSession: Bool
 
     private var state: ETConnectionState = .idle
     private var transport: (any Transport)?
@@ -94,6 +97,7 @@ actor ETConnection {
     private var heartbeatTask: Task<Void, Never>?
     private var writeDrainTask: Task<Void, Never>?
     private var waitingOnKeepAlive = false
+    private var isApplicationSuspended = false
     private var isClosed = false
     private var pendingWrites: [PendingWrite] = []
     private var isDrainingWrites = false
@@ -104,6 +108,7 @@ actor ETConnection {
         endpoint: TransportEndpoint,
         clientID: String,
         passkey: Data,
+        checkpoint: ETSessionCheckpoint? = nil,
         transportFactory: any TransportFactory = NWTransportFactory(),
         configuration: ETConnectionConfiguration = ETConnectionConfiguration()
     ) throws {
@@ -127,6 +132,11 @@ actor ETConnection {
         self.passkey = SecretKey(passkey)
         self.transportFactory = transportFactory
         self.configuration = configuration
+        restoresPreviousSession = checkpoint != nil
+        if let checkpoint {
+            reader = try BackedReader(key: passkey, checkpoint: checkpoint.reader)
+            writer = try BackedWriter(key: passkey, checkpoint: checkpoint.writer)
+        }
     }
 
     func connect(initialPayload: Et_InitialPayload) async throws {
@@ -144,25 +154,37 @@ actor ETConnection {
                 over: newTransport,
                 framingBuffer: &framingBuffer
             )
-            try validateInitial(response)
+            if restoresPreviousSession {
+                try validateReconnect(response)
+                guard let reader, let writer else {
+                    throw ETClientError.connectionClosed
+                }
+                try await recover(
+                    over: newTransport,
+                    framingBuffer: &framingBuffer,
+                    reader: reader,
+                    writer: writer
+                )
+            } else {
+                try validateInitial(response)
+                let newReader = try BackedReader(
+                    key: passkey,
+                    nonceMostSignificantByte: SecretBox.serverToClientNonceMostSignificantByte
+                )
+                let newWriter = try BackedWriter(
+                    key: passkey,
+                    nonceMostSignificantByte: SecretBox.clientToServerNonceMostSignificantByte
+                )
+                reader = newReader
+                writer = newWriter
 
-            let newReader = try BackedReader(
-                key: passkey,
-                nonceMostSignificantByte: SecretBox.serverToClientNonceMostSignificantByte
-            )
-            let newWriter = try BackedWriter(
-                key: passkey,
-                nonceMostSignificantByte: SecretBox.clientToServerNonceMostSignificantByte
-            )
-            reader = newReader
-            writer = newWriter
-
-            try await sendInitialPayload(initialPayload, over: newTransport, writer: newWriter)
-            try await receiveInitialResponse(
-                over: newTransport,
-                reader: newReader,
-                bufferedBytes: framingBuffer
-            )
+                try await sendInitialPayload(initialPayload, over: newTransport, writer: newWriter)
+                try await receiveInitialResponse(
+                    over: newTransport,
+                    reader: newReader,
+                    bufferedBytes: framingBuffer
+                )
+            }
             guard !isClosed else { throw ETClientError.connectionClosed }
             pendingTransport = nil
             activate(newTransport)
@@ -181,6 +203,7 @@ actor ETConnection {
 
     func send(_ packet: Packet) async throws {
         guard !isClosed else { throw ETClientError.connectionClosed }
+        guard !isApplicationSuspended else { throw ETClientError.applicationSuspended }
         guard writer != nil else { throw ETClientError.connectionClosed }
 
         try await withCheckedThrowingContinuation { continuation in
@@ -190,6 +213,36 @@ actor ETConnection {
         if state == .connected,
            packet.header != UInt8(Et_TerminalPacketType.keepAlive.rawValue),
            packet.header != UInt8(Et_EtPacketType.heartbeat.rawValue) {
+            startHeartbeat(generation: generation)
+        }
+    }
+
+    func checkpoint() async throws -> ETSessionCheckpoint {
+        guard !isClosed, let reader, let writer else {
+            throw ETClientError.connectionClosed
+        }
+        return await ETSessionCheckpoint(
+            reader: reader.checkpoint(),
+            writer: writer.checkpoint()
+        )
+    }
+
+    func prepareForApplicationBackground() async throws -> ETSessionCheckpoint {
+        guard !isClosed, reader != nil, writer != nil else {
+            throw ETClientError.connectionClosed
+        }
+        isApplicationSuspended = true
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        waitingOnKeepAlive = false
+        await waitForWriteDrain()
+        return try await checkpoint()
+    }
+
+    func resumeFromApplicationBackground() {
+        guard isApplicationSuspended else { return }
+        isApplicationSuspended = false
+        if state == .connected {
             startHeartbeat(generation: generation)
         }
     }
@@ -258,8 +311,12 @@ actor ETConnection {
 
     private func validateInitial(_ response: Et_ConnectResponse) throws {
         switch response.status {
-        case .newClient, .returningClient:
+        case .newClient:
             return
+        case .returningClient:
+            throw ETClientError.sessionUnrecoverable(
+                "The server recognizes this client, but no reliable-stream checkpoint was restored"
+            )
         case .invalidKey:
             throw ETClientError.invalidKey(response.error)
         case .mismatchedProtocol:
@@ -401,6 +458,7 @@ actor ETConnection {
     }
 
     private func startHeartbeat(generation heartbeatGeneration: UInt64) {
+        guard !isApplicationSuspended else { return }
         heartbeatTask?.cancel()
         heartbeatTask = Task { [weak self, interval = configuration.keepAliveInterval] in
             do {
@@ -413,7 +471,10 @@ actor ETConnection {
     }
 
     private func heartbeatTick(generation heartbeatGeneration: UInt64) async {
-        guard heartbeatGeneration == generation, state == .connected, !isClosed else {
+        guard heartbeatGeneration == generation,
+              state == .connected,
+              !isClosed,
+              !isApplicationSuspended else {
             return
         }
         if waitingOnKeepAlive {
@@ -554,33 +615,12 @@ actor ETConnection {
                 framingBuffer: &framingBuffer
             )
             try validateReconnect(response)
-
-            let localSequence = try await reader.sequenceHeader()
-            try await writeProto(localSequence, over: newTransport)
-            let remoteSequence = try await readProto(
-                Et_SequenceHeader.self,
+            try await recover(
                 over: newTransport,
-                buffer: &framingBuffer
+                framingBuffer: &framingBuffer,
+                reader: reader,
+                writer: writer
             )
-            let localCatchup = try await writer.catchupBuffer(
-                after: Int64(remoteSequence.sequenceNumber)
-            )
-            try await writeProto(localCatchup, over: newTransport)
-            let remoteCatchup = try await readProto(
-                Et_CatchupBuffer.self,
-                over: newTransport,
-                buffer: &framingBuffer
-            )
-
-            try await reader.revive(with: remoteCatchup.buffer)
-            await writer.revive()
-            let recoveredPackets = try await reader.receive(framingBuffer)
-            for packet in recoveredPackets {
-                if packet.header != UInt8(Et_TerminalPacketType.keepAlive.rawValue),
-                   packet.header != UInt8(Et_EtPacketType.heartbeat.rawValue) {
-                    packetContinuation.yield(packet)
-                }
-            }
             guard !isClosed, state == .reconnecting else {
                 throw ETClientError.connectionClosed
             }
@@ -613,6 +653,40 @@ actor ETConnection {
             }
             await newTransport.close()
             throw clientError
+        }
+    }
+
+    private func recover(
+        over newTransport: any Transport,
+        framingBuffer: inout Data,
+        reader: BackedReader,
+        writer: BackedWriter
+    ) async throws {
+        let localSequence = try await reader.sequenceHeader()
+        try await writeProto(localSequence, over: newTransport)
+        let remoteSequence = try await readProto(
+            Et_SequenceHeader.self,
+            over: newTransport,
+            buffer: &framingBuffer
+        )
+        let localCatchup = try await writer.catchupBuffer(
+            after: Int64(remoteSequence.sequenceNumber)
+        )
+        try await writeProto(localCatchup, over: newTransport)
+        let remoteCatchup = try await readProto(
+            Et_CatchupBuffer.self,
+            over: newTransport,
+            buffer: &framingBuffer
+        )
+
+        try await reader.revive(with: remoteCatchup.buffer)
+        await writer.revive()
+        let recoveredPackets = try await reader.receive(framingBuffer)
+        for packet in recoveredPackets {
+            if packet.header != UInt8(Et_TerminalPacketType.keepAlive.rawValue),
+               packet.header != UInt8(Et_EtPacketType.heartbeat.rawValue) {
+                packetContinuation.yield(packet)
+            }
         }
     }
 

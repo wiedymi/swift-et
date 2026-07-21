@@ -114,6 +114,71 @@ final class ETClientTests: XCTestCase {
         await session.close()
     }
 
+    func testCheckpointRestoresReturningClientWithoutRepeatingInitialHandshake() async throws {
+        let server = FakeETServer()
+        let original = try makeSession(server: server)
+        try await original.connect()
+        let beforeRelaunch = Data("before-relaunch".utf8)
+        try await original.send(beforeRelaunch)
+        try await eventually {
+            await server.snapshot().terminalInput == [beforeRelaunch]
+        }
+
+        let checkpoint = try await original.checkpoint()
+        let encoded = try JSONEncoder().encode(checkpoint)
+        let restoredCheckpoint = try JSONDecoder().decode(
+            ETSessionCheckpoint.self,
+            from: encoded
+        )
+        await original.close()
+
+        let restored = try ETTerminalSession(
+            endpoint: TransportEndpoint(host: "in-memory", port: 2022),
+            clientID: "test-client",
+            passkey: key,
+            checkpoint: restoredCheckpoint,
+            transportFactory: InMemoryTransportFactory(server: server),
+            configuration: ETConnectionConfiguration(
+                reconnectDelay: .milliseconds(10),
+                initializationTimeout: .seconds(1),
+                keepAliveInterval: .seconds(10)
+            )
+        )
+        try await restored.connect()
+        let afterRelaunch = Data("after-relaunch".utf8)
+        try await restored.send(afterRelaunch)
+
+        try await eventually {
+            let snapshot = await server.snapshot()
+            return snapshot.terminalInput == [beforeRelaunch, afterRelaunch]
+                && snapshot.initialPayloads.count == 1
+                && snapshot.reconnectClientSequences.count == 1
+        }
+        await restored.close()
+    }
+
+    func testBackgroundCheckpointPausesWritesUntilForegroundResume() async throws {
+        let server = FakeETServer()
+        let session = try makeSession(server: server)
+        try await session.connect()
+
+        _ = try await session.prepareForApplicationBackground()
+        do {
+            try await session.send(Data("must-not-send".utf8))
+            XCTFail("Expected background writes to be paused")
+        } catch {
+            XCTAssertEqual(error as? ETClientError, .applicationSuspended)
+        }
+
+        await session.resumeFromApplicationBackground()
+        let resumed = Data("foreground-write".utf8)
+        try await session.send(resumed)
+        try await eventually {
+            await server.snapshot().terminalInput == [resumed]
+        }
+        await session.close()
+    }
+
     func testMismatchedProtocolIsTypedError() async throws {
         let server = FakeETServer(
             acceptance: .reject(.mismatchedProtocol, "server speaks another version")

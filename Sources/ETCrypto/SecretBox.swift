@@ -47,6 +47,27 @@ package struct SecretBoxState: Sendable {
         nonce[XSalsa20Poly1305.nonceByteCount - 1] = nonceMostSignificantByte
     }
 
+    package init(key: [UInt8], nonce: Data) throws {
+        guard key.count == XSalsa20Poly1305.keyByteCount else {
+            throw ETProtocolError.invalidKeyLength(
+                expected: XSalsa20Poly1305.keyByteCount,
+                actual: key.count
+            )
+        }
+        guard nonce.count == XSalsa20Poly1305.nonceByteCount else {
+            throw ETProtocolError.invalidNonceLength(
+                expected: XSalsa20Poly1305.nonceByteCount,
+                actual: nonce.count
+            )
+        }
+        self.key = SecretKey(key)
+        self.nonce = Array(nonce)
+    }
+
+    package var checkpointNonce: Data {
+        Data(nonce)
+    }
+
     package mutating func seal<Message: ContiguousBytes>(_ message: Message) throws -> Data {
         incrementNonce()
         return try XSalsa20Poly1305.seal(message, nonce: nonce, key: key)

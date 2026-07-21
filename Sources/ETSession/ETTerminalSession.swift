@@ -58,6 +58,34 @@ public actor ETTerminalSession {
         )
     }
 
+    /// Restores a previously checkpointed session without starting a new remote shell.
+    public init(
+        host: String,
+        port: UInt16 = 2022,
+        clientID: String,
+        passkey: Data,
+        checkpoint: ETSessionCheckpoint,
+        tunnels: [ETTunnel] = [],
+        reverseTunnels: [ETTunnel] = [],
+        jumphost: Bool = false,
+        environmentVariables: [String: String] = [:]
+    ) throws {
+        try self.init(
+            endpoint: TransportEndpoint(host: host, port: port),
+            clientID: clientID,
+            passkey: passkey,
+            checkpoint: checkpoint,
+            tunnels: tunnels,
+            reverseTunnels: reverseTunnels,
+            jumphost: jumphost,
+            environmentVariables: environmentVariables,
+            transportFactory: NWTransportFactory(),
+            configuration: ETConnectionConfiguration(),
+            listenerFactory: SystemForwardingListenerFactory(),
+            forwardingSocketFactory: SystemForwardingSocketFactory()
+        )
+    }
+
     /// Creates a session from parsed forward and reverse tunnel strings.
     public init(
         host: String,
@@ -159,6 +187,7 @@ public actor ETTerminalSession {
         endpoint: TransportEndpoint,
         clientID: String,
         passkey: Data,
+        checkpoint: ETSessionCheckpoint? = nil,
         tunnels: [ETTunnel] = [],
         reverseTunnels: [ETTunnel] = [],
         jumphost: Bool = false,
@@ -183,6 +212,7 @@ public actor ETTerminalSession {
                 endpoint: endpoint,
                 clientID: clientID,
                 passkey: passkey,
+                checkpoint: checkpoint,
                 transportFactory: transportFactory,
                 configuration: configuration
             )
@@ -285,6 +315,28 @@ public actor ETTerminalSession {
     /// Nudges recovery after the consumer observes a network-path change.
     public func notifyNetworkPathChanged() async {
         await connection?.notifyNetworkPathChanged()
+    }
+
+    /// Captures the protocol state needed to reconnect this session from a new process.
+    public func checkpoint() async throws -> ETSessionCheckpoint {
+        guard hasConnected, !isClosed, let connection else {
+            throw ETClientError.connectionClosed
+        }
+        return try await connection.checkpoint()
+    }
+
+    /// Stops client writes and heartbeats after producing a durable background checkpoint.
+    /// The transport stays open and incoming output continues to be processed.
+    public func prepareForApplicationBackground() async throws -> ETSessionCheckpoint {
+        guard hasConnected, !isClosed, let connection else {
+            throw ETClientError.connectionClosed
+        }
+        return try await connection.prepareForApplicationBackground()
+    }
+
+    /// Resumes client writes and heartbeat monitoring after foreground activation.
+    public func resumeFromApplicationBackground() async {
+        await connection?.resumeFromApplicationBackground()
     }
 
     /// Closes the terminal session and finishes its streams.

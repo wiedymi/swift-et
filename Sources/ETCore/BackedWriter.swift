@@ -51,6 +51,37 @@ public actor BackedWriter {
         isConnected = connected
     }
 
+    package init<Key: ContiguousBytes & Sendable>(
+        key: Key,
+        checkpoint: BackedWriterCheckpoint
+    ) throws {
+        guard checkpoint.sequenceNumber >= 0,
+              let packetCount = Int64(exactly: checkpoint.serializedBackupPackets.count),
+              packetCount <= checkpoint.sequenceNumber else {
+            throw ETProtocolError.sequenceNumberOutOfRange
+        }
+        let restoredPackets = try checkpoint.serializedBackupPackets.map(Packet.init(serialized:))
+        guard restoredPackets.allSatisfy(\.encrypted) else {
+            throw ETProtocolError.packetNotEncrypted
+        }
+        var restoredSize = 0
+        for packet in restoredPackets {
+            let (nextSize, overflow) = restoredSize.addingReportingOverflow(packet.wireLength)
+            guard !overflow, nextSize <= Self.maximumBackupBytes else {
+                throw ETProtocolError.arithmeticOverflow
+            }
+            restoredSize = nextSize
+        }
+        crypto = try SecretBoxState(
+            key: key.withUnsafeBytes { Array($0) },
+            nonce: checkpoint.nonce
+        )
+        isConnected = false
+        backupBuffer = restoredPackets
+        backupSize = restoredSize
+        sequenceNumber = checkpoint.sequenceNumber
+    }
+
     /// Encrypts, sequences, and optionally frames one packet.
     public func write(_ packet: Packet) throws -> BackedWriterWrite {
         guard !packet.encrypted else {
@@ -145,5 +176,13 @@ public actor BackedWriter {
     /// Returns the full-width local sequence number.
     public func currentSequenceNumber() -> Int64 {
         sequenceNumber
+    }
+
+    package func checkpoint() -> BackedWriterCheckpoint {
+        BackedWriterCheckpoint(
+            nonce: crypto.checkpointNonce,
+            sequenceNumber: sequenceNumber,
+            serializedBackupPackets: backupBuffer.map { $0.serialized() }
+        )
     }
 }

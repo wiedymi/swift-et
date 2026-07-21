@@ -26,6 +26,21 @@ public actor BackedReader {
         isConnected = connected
     }
 
+    package init<Key: ContiguousBytes & Sendable>(
+        key: Key,
+        checkpoint: BackedReaderCheckpoint
+    ) throws {
+        guard checkpoint.sequenceNumber >= 0 else {
+            throw ETProtocolError.sequenceNumberOutOfRange
+        }
+        crypto = try SecretBoxState(
+            key: key.withUnsafeBytes { Array($0) },
+            nonce: checkpoint.nonce
+        )
+        isConnected = false
+        sequenceNumber = checkpoint.sequenceNumber
+    }
+
     /// Consumes bytes and returns every complete decrypted packet in order.
     public func receive(_ bytes: Data = Data()) throws -> [Packet] {
         guard isConnected else { return [] }
@@ -111,6 +126,13 @@ public actor BackedReader {
     /// Indicates whether recovery ciphertext remains to be delivered.
     public func hasRecoveredPackets() -> Bool {
         localBufferIndex < localBuffer.count
+    }
+
+    package func checkpoint() -> BackedReaderCheckpoint {
+        BackedReaderCheckpoint(
+            nonce: crypto.checkpointNonce,
+            sequenceNumber: sequenceNumber
+        )
     }
 
     private func frameLength(in bytes: Data, at offset: Int) throws -> Int {
