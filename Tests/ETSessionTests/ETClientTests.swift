@@ -157,6 +157,43 @@ final class ETClientTests: XCTestCase {
         await restored.close()
     }
 
+    func testStaleCheckpointIsUnrecoverableInsteadOfTransportFailure() async throws {
+        let server = FakeETServer()
+        let original = try makeSession(server: server)
+        try await original.connect()
+        let staleCheckpoint = try await original.checkpoint()
+
+        let sentAfterCheckpoint = Data("sent-after-checkpoint".utf8)
+        try await original.send(sentAfterCheckpoint)
+        try await eventually {
+            await server.snapshot().terminalInput == [sentAfterCheckpoint]
+        }
+        await original.close()
+
+        let restored = try ETTerminalSession(
+            endpoint: TransportEndpoint(host: "in-memory", port: 2022),
+            clientID: "test-client",
+            passkey: key,
+            checkpoint: staleCheckpoint,
+            transportFactory: InMemoryTransportFactory(server: server),
+            configuration: ETConnectionConfiguration(
+                reconnectDelay: .milliseconds(10),
+                initializationTimeout: .seconds(1),
+                keepAliveInterval: .seconds(10)
+            )
+        )
+
+        do {
+            try await restored.connect()
+            XCTFail("Expected stale checkpoint recovery to fail permanently")
+        } catch {
+            guard case .sessionUnrecoverable = error as? ETClientError else {
+                return XCTFail("Expected sessionUnrecoverable, got \(error)")
+            }
+        }
+        await restored.close()
+    }
+
     func testBackgroundCheckpointPausesWritesUntilForegroundResume() async throws {
         let server = FakeETServer()
         let session = try makeSession(server: server)

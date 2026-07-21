@@ -39,7 +39,7 @@ Add to `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/wiedymi/swift-et", from: "0.1.4")
+    .package(url: "https://github.com/wiedymi/swift-et", from: "0.1.5")
 ]
 ```
 

@@ -195,7 +195,9 @@ actor ETConnection {
             writer = nil
             transport = nil
             guard !isClosed else { throw ETClientError.connectionClosed }
-            let clientError = mapError(error)
+            let clientError = restoresPreviousSession
+                ? mapRecoveryError(error)
+                : mapError(error)
             updateState(.failed(clientError))
             throw clientError
         }
@@ -628,15 +630,7 @@ actor ETConnection {
             pendingTransport = nil
             activate(newTransport)
         } catch {
-            let clientError: ETClientError
-            switch error as? ETProtocolError {
-            case .recoveryUnavailable, .sequenceNumberOutOfRange:
-                // Retrying cannot help: the catchup gap only grows and sequence
-                // numbers never shrink, so classify as permanently unrecoverable.
-                clientError = .sessionUnrecoverable(String(describing: error))
-            default:
-                clientError = mapError(error)
-            }
+            let clientError = mapRecoveryError(error)
             let isPermanentFailure: Bool
             switch clientError {
             case .invalidKey, .mismatchedProtocol, .sessionUnrecoverable:
@@ -840,6 +834,18 @@ actor ETConnection {
             return error
         }
         return .transportFailure(String(describing: error))
+    }
+
+    private func mapRecoveryError(_ error: any Error) -> ETClientError {
+        switch error as? ETProtocolError {
+        case .recoveryUnavailable, .sequenceNumberOutOfRange:
+            // Retrying the same checkpoint cannot help: the catchup gap only
+            // grows and sequence numbers never shrink. The caller must discard
+            // the checkpoint before starting a fresh server-side session.
+            return .sessionUnrecoverable(String(describing: error))
+        default:
+            return mapError(error)
+        }
     }
 
     private func updateState(_ newState: ETConnectionState) {
