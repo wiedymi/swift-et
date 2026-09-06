@@ -388,10 +388,21 @@ public actor ETTerminalSession {
             for await state in states {
                 guard !Task.isCancelled else { return }
                 guard state != .idle else { continue }
-                await self?.emitState(state)
+                await self?.forwardState(state)
             }
             await self?.finishStateChangesIfTerminal()
         }
+    }
+
+    private func forwardState(_ state: ETConnectionState) async {
+        if state == .sessionEnded {
+            // Deliver the final terminal bytes before consumers tear down the session.
+            await packetTask?.value
+            await portForwardHandler?.close()
+            portForwardHandler = nil
+        }
+        guard !isClosed else { return }
+        emitState(state)
     }
 
     private func startPacketForwarding(
@@ -436,7 +447,7 @@ public actor ETTerminalSession {
 
     private func finishStateChangesIfTerminal() {
         switch currentState {
-        case .failed, .closed:
+        case .failed, .sessionEnded, .closed:
             stateContinuation.finish()
         case .idle, .bootstrapping, .connecting, .connected, .disconnected, .reconnecting:
             return

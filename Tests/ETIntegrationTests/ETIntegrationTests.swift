@@ -36,6 +36,29 @@ final class ETIntegrationTests: XCTestCase {
         }
     }
 
+    func testShellExitEndsSessionWithoutFailure() async throws {
+        try requireIntegration()
+        for input in [Data("exit\n".utf8), Data([4])] {
+            try await withFixture { fixture in
+                let session = try await fixture.connectSession()
+                let states = Task {
+                    var result: [ETConnectionState] = []
+                    for await state in session.stateChanges { result.append(state) }
+                    return result
+                }
+                let timeout = Task {
+                    try await Task.sleep(for: .seconds(10))
+                    await session.close()
+                }
+                defer { timeout.cancel() }
+                try await session.send(input)
+                let observed = await states.value
+                XCTAssertEqual(observed.last, .sessionEnded)
+                XCTAssertFalse(observed.contains { if case .failed = $0 { return true }; return false })
+            }
+        }
+    }
+
     func testTerminalResizeDoesNotError() async throws {
         try requireIntegration()
         try await withFixture { fixture in

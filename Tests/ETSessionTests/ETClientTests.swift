@@ -475,7 +475,7 @@ final class ETClientTests: XCTestCase {
         await session.close()
     }
 
-    func testPermanentReconnectFailureFullyTearsDownConnection() async throws {
+    func testExpiredSessionFullyTearsDownConnection() async throws {
         let reconnectGate = TestPauseGate()
         let server = FakeETServer(
             acceptance: .rejectReconnect(.invalidKey, "revoked passkey"),
@@ -510,7 +510,7 @@ final class ETClientTests: XCTestCase {
             XCTAssertEqual(error as? ETClientError, .connectionClosed)
         }
         let states = await stateTask.value
-        XCTAssertEqual(states.last, .failed(.invalidKey("revoked passkey")))
+        XCTAssertEqual(states.last, .sessionEnded)
 
         do {
             try await session.send(Data("after failure".utf8))

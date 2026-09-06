@@ -58,6 +58,8 @@ public enum ETConnectionState: Equatable, Sendable {
     case reconnecting
     /// A nonrecoverable error ended the session.
     case failed(ETClientError)
+    /// The server no longer has the session requested during recovery.
+    case sessionEnded
     /// The consumer closed the session.
     case closed
 }
@@ -291,7 +293,7 @@ actor ETConnection {
             await connectionDidFail(generation: generation)
         case .reconnecting:
             reconnectBackoffTask?.cancel()
-        case .idle, .bootstrapping, .connecting, .disconnected, .failed, .closed:
+        case .idle, .bootstrapping, .connecting, .disconnected, .failed, .sessionEnded, .closed:
             return
         }
     }
@@ -576,15 +578,15 @@ actor ETConnection {
                     return
                 } catch let error as ETClientError {
                     if case .invalidKey = error {
-                        await self.failPermanently(error)
+                        await self.finishPermanently(.sessionEnded)
                         return
                     }
                     if case .mismatchedProtocol = error {
-                        await self.failPermanently(error)
+                        await self.finishPermanently(.failed(error))
                         return
                     }
                     if case .sessionUnrecoverable = error {
-                        await self.failPermanently(error)
+                        await self.finishPermanently(.failed(error))
                         return
                     }
                 } catch {
@@ -704,7 +706,7 @@ actor ETConnection {
         reconnectBackoffTask = nil
     }
 
-    private func failPermanently(_ error: ETClientError) async {
+    private func finishPermanently(_ terminalState: ETConnectionState) async {
         guard !isClosed else { return }
         isClosed = true
         generation &+= 1
@@ -742,7 +744,7 @@ actor ETConnection {
         for waiter in waiters {
             waiter.resume()
         }
-        updateState(.failed(error))
+        updateState(terminalState)
         packetContinuation.finish()
         stateContinuation.finish()
     }

@@ -39,7 +39,7 @@ Add to `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/wiedymi/swift-et", from: "0.1.5")
+    .package(url: "https://github.com/wiedymi/swift-et", from: "0.1.6")
 ]
 ```
 
@@ -156,6 +156,8 @@ try await restored.connect()
 ```
 
 If the process remains alive, call `resumeFromApplicationBackground()` after foregrounding.
+
+Recovery rejection for an existing session emits `ETConnectionState.sessionEnded`, matching the official ET client. Initial key rejection remains an error. Session end does not distinguish shell exit from server-side session loss.
 
 ## Testing
 
