@@ -2,3 +2,6 @@
 .build/
 .swiftpm/
 xcuserdata/
+
+# Optional upstream reference checkout; never a package dependency.
+/refs/EternalTerminal/

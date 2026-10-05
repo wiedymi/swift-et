@@ -177,6 +177,20 @@ Benchmarks:
 swift run -c release Benchmarks
 ```
 
+## Upstream reference
+
+Package builds use the checked-in Swift sources and protobuf files. They do not
+need an upstream checkout. For protocol work or `scripts/gen-proto.sh`, fetch the
+reference source explicitly, without its nested submodules:
+
+```sh
+git clone --filter=blob:none --no-checkout --no-recurse-submodules https://github.com/MisterTea/EternalTerminal.git refs/EternalTerminal
+git -C refs/EternalTerminal checkout 3dd946d7128ea98653bbbab2f454706aa66d9893
+```
+
+This optional directory is ignored by Git. Building the upstream C++ server may
+need additional dependencies; use a separate checkout for that work.
+
 ## License
 
 MIT

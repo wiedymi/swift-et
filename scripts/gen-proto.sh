@@ -6,6 +6,11 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 proto_root="$repository_root/refs/EternalTerminal/proto"
 output_root="$repository_root/Sources/ETCore/Proto"
 
+if [ ! -f "$proto_root/ET.proto" ] || [ ! -f "$proto_root/ETerminal.proto" ]; then
+  echo "error: upstream proto files are missing; see README.md Upstream reference" >&2
+  exit 1
+fi
+
 if ! command -v protoc >/dev/null 2>&1; then
   echo "error: protoc is required" >&2
   exit 1

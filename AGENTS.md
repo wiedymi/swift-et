@@ -4,7 +4,7 @@ Pure Swift SPM package implementing the Eternal Terminal (ET) protocol **client*
 
 ## Reference source
 
-`refs/EternalTerminal` is a git submodule with the canonical C++ implementation. It is read-only reference material — never modify it, never compile it into the package. When any wire-format detail is ambiguous, the C++ source is the source of truth, not this document.
+`refs/EternalTerminal` is an optional, ignored checkout of the canonical C++ implementation. Fetch it only for protocol work; see README.md. Package consumers must not download reference repositories. It is read-only reference material — never modify it, never compile it into the package. When any wire-format detail is ambiguous, the C++ source is the source of truth, not this document.
 
 Key reference files:
 
@@ -56,7 +56,7 @@ Tests/
   ETSessionTests/          state machine tests with in-memory Transport
   ETIntegrationTests/      against a real etserver (skipped unless ET_INTEGRATION=1)
 Benchmarks/                crypto + framing throughput; swift-sodium as oracle/baseline
-refs/EternalTerminal/      submodule, reference only
+refs/EternalTerminal/      optional ignored checkout, reference only
 ```
 
 Generated protobuf Swift files are **checked in** (regenerate with `scripts/gen-proto.sh`; `brew install swift-protobuf` provides `protoc-gen-swift`). Consumers must not need protoc.
