@@ -31,6 +31,8 @@ public actor ETTerminalSession {
     private var isConnecting = false
     private var hasConnected = false
     private var isClosed = false
+    private var desiredTerminalDimensions: ETTerminalDimensions?
+    private var sentTerminalDimensions: ETTerminalDimensions?
 
     /// Creates a session from credentials acquired out of band.
     public init(
@@ -230,10 +232,13 @@ public actor ETTerminalSession {
     }
 
     /// Bootstraps when necessary and connects the terminal session.
-    public func connect() async throws {
+    public func connect(initialDimensions: ETTerminalDimensions? = nil) async throws {
         guard !isClosed else { throw ETClientError.connectionClosed }
         guard !isConnecting else { throw ETClientError.connectionInProgress }
         guard !hasConnected else { return }
+        if desiredTerminalDimensions == nil {
+            desiredTerminalDimensions = initialDimensions
+        }
         isConnecting = true
 
         do {
@@ -244,12 +249,13 @@ public actor ETTerminalSession {
                 socketFactory: forwardingSocketFactory
             )
             portForwardHandler = handler
-            startStateForwarding(connection)
             startPacketForwarding(connection: connection, handler: handler)
             try await handler.start(forwardTunnels: forwardTunnels)
             try await connection.connect(initialPayload: initialPayload)
-            isConnecting = false
+            try await sendPendingTerminalDimensions(using: connection)
             hasConnected = true
+            isConnecting = false
+            startStateForwarding(connection)
         } catch {
             isConnecting = false
             hasConnected = false
@@ -283,33 +289,16 @@ public actor ETTerminalSession {
         pixelWidth: Int? = nil,
         pixelHeight: Int? = nil
     ) async throws {
-        guard hasConnected, !isClosed, let connection else {
-            throw ETClientError.connectionClosed
-        }
-        guard rows > 0, cols > 0,
-              let wireRows = Int32(exactly: rows),
-              let wireColumns = Int32(exactly: cols) else {
-            throw ETClientError.invalidTerminalSize(rows: rows, columns: cols)
-        }
-        guard pixelWidth.map({ $0 >= 0 && Int32(exactly: $0) != nil }) ?? true,
-              pixelHeight.map({ $0 >= 0 && Int32(exactly: $0) != nil }) ?? true else {
-            throw ETClientError.invalidTerminalPixels(
-                width: pixelWidth,
-                height: pixelHeight
-            )
-        }
-
-        var terminalInfo = Et_TerminalInfo()
-        terminalInfo.row = wireRows
-        terminalInfo.column = wireColumns
-        if let pixelWidth { terminalInfo.width = Int32(pixelWidth) }
-        if let pixelHeight { terminalInfo.height = Int32(pixelHeight) }
-        try await connection.send(
-            Packet(
-                header: UInt8(Et_TerminalPacketType.terminalInfo.rawValue),
-                payload: try terminalInfo.serializedData()
-            )
+        guard !isClosed else { throw ETClientError.connectionClosed }
+        let dimensions = try ETTerminalDimensions(
+            rows: rows,
+            columns: cols,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
         )
+        desiredTerminalDimensions = dimensions
+        guard hasConnected, !isClosed, let connection else { return }
+        try await sendPendingTerminalDimensions(using: connection)
     }
 
     /// Nudges recovery after the consumer observes a network-path change.
@@ -336,7 +325,10 @@ public actor ETTerminalSession {
 
     /// Resumes client writes and heartbeat monitoring after foreground activation.
     public func resumeFromApplicationBackground() async {
-        await connection?.resumeFromApplicationBackground()
+        guard let connection else { return }
+        await connection.resumeFromApplicationBackground()
+        guard hasConnected else { return }
+        try? await sendPendingTerminalDimensions(using: connection)
     }
 
     /// Closes the terminal session and finishes its streams.
@@ -388,13 +380,28 @@ public actor ETTerminalSession {
             for await state in states {
                 guard !Task.isCancelled else { return }
                 guard state != .idle else { continue }
-                await self?.forwardState(state)
+                await self?.forwardState(state, connection: connection)
             }
             await self?.finishStateChangesIfTerminal()
         }
     }
 
-    private func forwardState(_ state: ETConnectionState) async {
+    private func forwardState(
+        _ state: ETConnectionState,
+        connection: ETConnection
+    ) async {
+        switch state {
+        case .disconnected, .reconnecting:
+            sentTerminalDimensions = nil
+        case .connected:
+            do {
+                try await sendPendingTerminalDimensions(using: connection)
+            } catch {
+                return
+            }
+        case .idle, .bootstrapping, .connecting, .failed, .sessionEnded, .closed:
+            break
+        }
         if state == .sessionEnded {
             // Deliver the final terminal bytes before consumers tear down the session.
             await packetTask?.value
@@ -403,6 +410,14 @@ public actor ETTerminalSession {
         }
         guard !isClosed else { return }
         emitState(state)
+    }
+
+    private func sendPendingTerminalDimensions(using connection: ETConnection) async throws {
+        while let desiredTerminalDimensions,
+              desiredTerminalDimensions != sentTerminalDimensions {
+            try await connection.send(desiredTerminalDimensions.packet())
+            sentTerminalDimensions = desiredTerminalDimensions
+        }
     }
 
     private func startPacketForwarding(

@@ -41,6 +41,152 @@ final class ETClientTests: XCTestCase {
         await session.close()
     }
 
+    func testConnectSendsInitialTerminalSizeBeforePublishingConnected() async throws {
+        let server = FakeETServer()
+        let session = try makeSession(server: server)
+        let sizeAtConnected = expectation(description: "size sent before connected")
+        let stateTask = Task {
+            for await state in session.stateChanges where state == .connected {
+                let sizes = await server.snapshot().terminalSizes
+                XCTAssertEqual(sizes, [TerminalSize(rows: 37, columns: 119)])
+                sizeAtConnected.fulfill()
+                return
+            }
+        }
+        defer { stateTask.cancel() }
+
+        try await session.connect(
+            initialDimensions: ETTerminalDimensions(rows: 37, columns: 119)
+        )
+
+        await fulfillment(of: [sizeAtConnected], timeout: 1)
+        await session.close()
+    }
+
+    func testResizeDuringConnectReplacesStaleInitialDimensions() async throws {
+        let server = FakeETServer()
+        let readGate = TestPauseGate()
+        let transportFactory = ControlledTransportFactory(
+            server: server,
+            firstReadGate: readGate
+        )
+        let session = try makeSession(
+            server: server,
+            transportFactory: transportFactory
+        )
+
+        let connectTask = Task {
+            try await session.connect(
+                initialDimensions: ETTerminalDimensions(rows: 24, columns: 80)
+            )
+        }
+        await readGate.waitUntilPaused()
+        try await session.resize(rows: 48, cols: 160)
+        await readGate.release()
+        try await connectTask.value
+
+        let sizes = await server.snapshot().terminalSizes
+        XCTAssertEqual(sizes, [TerminalSize(rows: 48, columns: 160)])
+        await session.close()
+    }
+
+    func testRepeatedTerminalSizeIsSentOnlyOncePerConnection() async throws {
+        let server = FakeETServer()
+        let session = try makeSession(server: server)
+        let dimensions = try ETTerminalDimensions(rows: 44, columns: 132)
+
+        try await session.connect(initialDimensions: dimensions)
+        try await session.resize(rows: 44, cols: 132)
+        try await session.resize(rows: 44, cols: 132)
+
+        let sizes = await server.snapshot().terminalSizes
+        XCTAssertEqual(sizes, [TerminalSize(rows: 44, columns: 132)])
+        await session.close()
+    }
+
+    func testReconnectReplaysCurrentTerminalSize() async throws {
+        let server = FakeETServer()
+        let session = try makeSession(
+            server: server,
+            reconnectDelay: .milliseconds(5),
+            keepAliveInterval: .seconds(10)
+        )
+        let dimensions = try ETTerminalDimensions(rows: 53, columns: 171)
+        let connectedStates = expectation(description: "size precedes each connected state")
+        connectedStates.expectedFulfillmentCount = 2
+        let stateTask = Task {
+            var connectedCount = 0
+            for await state in session.stateChanges where state == .connected {
+                connectedCount += 1
+                let sizes = await server.snapshot().terminalSizes
+                XCTAssertEqual(sizes.count, connectedCount)
+                connectedStates.fulfill()
+                if connectedCount == 2 { return }
+            }
+        }
+        defer { stateTask.cancel() }
+
+        try await session.connect(initialDimensions: dimensions)
+        await server.disconnectClient()
+
+        await fulfillment(of: [connectedStates], timeout: 1)
+        try await eventually {
+            let snapshot = await server.snapshot()
+            return snapshot.connectionCount >= 2
+                && snapshot.terminalSizes.count == 2
+        }
+        let snapshot = await server.snapshot()
+        XCTAssertEqual(
+            snapshot.terminalSizes,
+            [
+                TerminalSize(rows: 53, columns: 171),
+                TerminalSize(rows: 53, columns: 171),
+            ]
+        )
+        await session.close()
+    }
+
+    func testTerminalDimensionsRejectInvalidAndOverflowingValues() throws {
+        XCTAssertThrowsError(try ETTerminalDimensions(rows: 0, columns: 80)) {
+            XCTAssertEqual(
+                $0 as? ETClientError,
+                .invalidTerminalSize(rows: 0, columns: 80)
+            )
+        }
+        XCTAssertThrowsError(try ETTerminalDimensions(rows: 24, columns: Int.max)) {
+            XCTAssertEqual(
+                $0 as? ETClientError,
+                .invalidTerminalSize(rows: 24, columns: Int.max)
+            )
+        }
+        XCTAssertThrowsError(
+            try ETTerminalDimensions(
+                rows: 24,
+                columns: 80,
+                pixelWidth: Int.max
+            )
+        ) {
+            XCTAssertEqual(
+                $0 as? ETClientError,
+                .invalidTerminalPixels(width: Int.max, height: nil)
+            )
+        }
+    }
+
+    func testResizeAfterCloseStillFails() async throws {
+        let server = FakeETServer()
+        let session = try makeSession(server: server)
+        try await session.connect()
+        await session.close()
+
+        do {
+            try await session.resize(rows: 24, cols: 80)
+            XCTFail("Expected resize after close to fail")
+        } catch {
+            XCTAssertEqual(error as? ETClientError, .connectionClosed)
+        }
+    }
+
     func testResizeEncodesOptionalPixelDimensions() async throws {
         let server = FakeETServer()
         let session = try makeSession(server: server)
