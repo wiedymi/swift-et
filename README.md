@@ -74,7 +74,9 @@ let session = try ETTerminalSession(
     passkey: passkey
 )
 
-try await session.connect()
+try await session.connect(
+    initialDimensions: ETTerminalDimensions(rows: 24, columns: 80)
+)
 
 Task {
     for await data in session.output {

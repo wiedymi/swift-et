@@ -19,6 +19,12 @@ update cell and pixel dimensions with
 ``ETTerminalSession/resize(rows:cols:pixelWidth:pixelHeight:)``. Close the session explicitly
 when its owner is finished.
 
+When the terminal grid is already known, pass ``ETTerminalDimensions`` to
+``ETTerminalSession/connect(initialDimensions:)``. The session sends those dimensions before
+publishing its connected state, so a shell or TUI started by the state observer cannot race a
+zero-sized remote PTY. A resize received while connection is in progress replaces the initial
+value, and the latest successfully sent dimensions are replayed after transport recovery.
+
 ## Reconnection semantics
 
 After transport loss, the session emits ``ETConnectionState/disconnected`` immediately before
@@ -45,6 +51,7 @@ the C++ implementation silently wraps.
 ### Session
 
 - ``ETTerminalSession``
+- ``ETTerminalDimensions``
 - ``ETConnectionState``
 - ``ETClientError``
 - ``ETSessionCheckpoint``
